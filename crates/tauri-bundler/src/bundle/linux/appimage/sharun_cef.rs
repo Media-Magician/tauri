@@ -111,14 +111,17 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
   ];
 
   for f in cef_files {
-    let dest = if f == "chrome-sandbox" {
-      data_dir.join("usr/bin/").join(f)
-    } else {
-      data_dir.join("usr/lib/").join(f)
-    };
+    if f == "chrome-sandbox" {
+      let dest = data_dir.join("usr/bin/").join(f);
+      fs::copy(cef_path.join(f), &dest)?;
+      let _ = Command::new("strip").arg(&dest).output_ok();
+    }
+
+    let dest = data_dir.join("usr/lib/").join(f);
     fs::copy(cef_path.join(f), &dest)?;
     let _ = Command::new("strip").arg(&dest).output_ok();
   }
+
   let locales = [
     "en-US.pak",
     "en-US_FEMININE.pak",
@@ -182,14 +185,16 @@ pub fn bundle_project(settings: &Settings) -> crate::Result<Vec<PathBuf>> {
     .args([
       "-c",
       &format!(
-        r#""{}" "{}" {bins} "{}" "{}""#,
+        r#""{}" "{}" {bins} "{}" "{}" "{}" "{}""#,
         quick_sharun.to_string_lossy(),
         data_dir
           .join(format!("usr/bin/{}", main_binary.name()))
           .to_string_lossy(),
         // TODO: This may have to be in lib instead
         data_dir.join("usr/bin/chrome-sandbox").to_string_lossy(),
-        data_dir.join("usr/lib/").to_string_lossy()
+        data_dir.join("usr/lib/chrome-sandbox").to_string_lossy(),
+        data_dir.join("usr/lib/").to_string_lossy(),
+        data_dir.join("usr/lib/libcef.so").to_string_lossy()
       ),
     ])
     .output_ok()
