@@ -1,5 +1,13 @@
 # Changelog
 
+## \[2.8.3]
+
+### Bug Fixes
+
+- [`7b16dafb1`](https://www.github.com/tauri-apps/tauri/commit/7b16dafb1dc417536ebb62df8eb66154dd97109d) ([#14986](https://www.github.com/tauri-apps/tauri/pull/14986) by [@montyc1999](https://www.github.com/tauri-apps/tauri/../../montyc1999)) Sort csp/plugin/header configs when generating HashMap constructors so that `generate_context!` is deterministic.
+
+  See: https://github.com/tauri-apps/tauri/issues/14978 for more information
+
 ## \[2.8.2]
 
 ### Enhancements
