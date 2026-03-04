@@ -182,6 +182,7 @@ wrap_resource_handler! {
     initialization_scripts: Arc<Vec<CefInitScript>>,
     // we clone response to send it to the handler thread
     response: HttpResponse,
+    url: Option<String>,
   }
 
   impl ResourceHandler {
@@ -250,9 +251,23 @@ wrap_resource_handler! {
         let method = http::Method::from_bytes(method_str.as_bytes())
           .unwrap_or(http::Method::GET);
 
+        let origin = self.url.as_ref().and_then(|url| Url::parse(url).ok()).and_then(|url| {
+          let origin = url.origin();
+          match origin {
+            url::Origin::Tuple(_, _, _) => Some(origin.ascii_serialization()),
+            // if the origin is not a regular scheme, host, port url, we can probably ignore it?
+            _ => None,
+          }
+        });
+
         std::thread::spawn(move || {
           let mut http_request = http::Request::builder().method(method).uri(url.as_str()).body(data).unwrap();
           *http_request.headers_mut() = headers;
+          if let Some(origin) = origin {
+            if let Ok(value) = HeaderValue::from_str(&origin) {
+              http_request.headers_mut().insert(http::header::ORIGIN, value);
+            }
+          }
           // handler is Arc<Box<UriSchemeProtocol>>, so we need to dereference to call it
           (**handler)(&label, http_request, responder);
         });
@@ -354,8 +369,10 @@ wrap_scheme_handler_factory! {
         .unwrap()
         .get(&(id, self.scheme.clone()))
         .cloned()?;
+      
+      let url = _frame.map(|f| f.url()).map(|url| CefString::from(&url).to_string());
 
-      Some(WebResourceHandler::new(webview_label, handler, initialization_scripts, Arc::new(RefCell::new(None))))
+      Some(WebResourceHandler::new(webview_label, handler, initialization_scripts, Arc::new(RefCell::new(None)), url))
     }
   }
 }
