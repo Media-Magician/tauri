@@ -288,7 +288,20 @@ pub fn cargo_command(
     validate_target(available_targets, target)?;
   }
 
-  build_cmd.args(&options.args);
+  // build_cmd.args(&options.args);
+  let mut skip_next = false;
+  for arg in &options.args {
+    if skip_next {
+      skip_next = false;
+      continue;
+    }
+    if arg == "--archive" {
+      skip_next = true;
+      continue;
+    }
+    
+    build_cmd.arg(arg);
+  }
 
   let mut features = config_features;
   features.extend(options.features);

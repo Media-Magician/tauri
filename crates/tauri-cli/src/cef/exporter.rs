@@ -263,6 +263,7 @@ pub fn ensure_cef_directory(
   target: Option<&str>,
   enabled_features: &[String],
   workspace_dir: &Path,
+  archive: Option<PathBuf>,
 ) -> crate::Result<Option<PathBuf>> {
   // Check if cef feature is enabled
   let cef_enabled = enabled_features
@@ -304,7 +305,7 @@ pub fn ensure_cef_directory(
       mirror_url: None,
       force: false,
       overwrite: true,
-      archive: None,
+      archive,
     },
     workspace_dir,
   )?;

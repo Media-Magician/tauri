@@ -70,3 +70,4 @@ opt-level = "s"
 tauri = { path = "./crates/tauri" }
 tauri-plugin = { path = "./crates/tauri-plugin" }
 tauri-utils = { path = "./crates/tauri-utils" }
+download-cef = { git = "https://github.com/Media-Magician/cef-rs.git" }

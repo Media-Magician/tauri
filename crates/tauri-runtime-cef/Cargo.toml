@@ -19,9 +19,9 @@ html5ever = "0.29"
 raw-window-handle = "0.6"
 url = "2"
 http = "1"
-cef = { version = "=144.1.0", default-features = false }
+cef = { default-features = false, git = "https://github.com/Media-Magician/cef-rs.git" }
 # Not actually used directly, just locking it.
-cef-dll-sys = "=144.1.0"
+cef-dll-sys = { git = "https://github.com/Media-Magician/cef-rs.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 kuchiki = { package = "kuchikiki", version = "0.8.8-speedreader" }
@@ -38,10 +38,15 @@ windows = { version = "0.61", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_LibraryLoader",
 ] }
+windows-sys = { version = "0.61", features = [
+  "Win32_System_Environment",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging"
+] }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = [] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
 objc2-foundation = { version = "0.3", features = ["NSNotification"] }
 
 [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]

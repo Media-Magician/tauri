@@ -522,6 +522,7 @@ fn ensure_cef_directory_if_needed(
     target_triple,
     &enabled_features,
     &app_settings.workspace_dir,
+    options.args.windows(2).find_map(|window| (window[0] == "--archive").then_some(PathBuf::from(window[1].as_str())))
   ) {
     // cef not enabled
     Ok(None) => {}

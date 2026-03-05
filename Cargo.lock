@@ -1173,9 +1173,8 @@ dependencies = [
 
 [[package]]
 name = "cef"
-version = "144.1.0+144.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd219b8919445d9a848015e0c3d50fd6b89f5521e711e956aa13f7f6f52992eb"
+version = "146.0.0+146.0.76"
+source = "git+https://github.com/Media-Magician/cef-rs.git#a7f5106ee7f617ef4ceafb7c3060bbf384107741"
 dependencies = [
  "cef-dll-sys",
  "libloading 0.9.0",
@@ -1185,9 +1184,8 @@ dependencies = [
 
 [[package]]
 name = "cef-dll-sys"
-version = "144.1.0+144.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abb6189602922e778b99ffc8a8635e696b1417457be3270fd53831eb30bb4843"
+version = "146.0.0+146.0.76"
+source = "git+https://github.com/Media-Magician/cef-rs.git#a7f5106ee7f617ef4ceafb7c3060bbf384107741"
 dependencies = [
  "anyhow",
  "cmake",
@@ -1362,7 +1360,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -2059,7 +2057,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.61.1",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2120,8 +2118,7 @@ dependencies = [
 [[package]]
 name = "download-cef"
 version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6002a6b95f9f3bbe5693ac02a03221a8e3af6c9f5f4539f5734a8d6cde1a3616"
+source = "git+https://github.com/Media-Magician/cef-rs.git#a7f5106ee7f617ef4ceafb7c3060bbf384107741"
 dependencies = [
  "bzip2 0.6.0",
  "clap",
@@ -4454,7 +4451,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -5981,7 +5978,7 @@ dependencies = [
  "aes-gcm",
  "aes-kw",
  "argon2",
- "base64 0.22.1",
+ "base64 0.21.7",
  "bitfield",
  "block-padding",
  "blowfish",
@@ -7366,7 +7363,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.1",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9069,6 +9066,7 @@ dependencies = [
  "tauri-utils",
  "url",
  "windows 0.61.1",
+ "windows-sys 0.61.1",
  "x11-dl",
 ]
 
@@ -10527,7 +10525,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
