@@ -14,7 +14,7 @@ use crate::{Manager, Runtime, image::Image, menu::*};
 ///
 /// ```no_run
 /// use tauri::menu::*;
-/// tauri::Builder::<tauri::Wry>::new()
+/// tauri::Builder::default()
 ///   .setup(move |app| {
 ///     let handle = app.handle();
 ///     # let icon1 = tauri::image::Image::new(&[], 0, 0);
@@ -85,7 +85,7 @@ impl<'m, R: Runtime, M: Manager<R>> MenuBuilder<'m, R, M> {
 ///
 /// ```no_run
 /// use tauri::menu::*;
-/// tauri::Builder::<tauri::Wry>::new()
+/// tauri::Builder::default()
 ///   .setup(move |app| {
 ///     let handle = app.handle();
 ///     # let icon1 = tauri::image::Image::new(&[], 0, 0);
@@ -640,6 +640,31 @@ macro_rules! shared_menu_builder {
         self
           .items
           .push(PredefinedMenuItem::services(self.manager, Some(text.as_ref())).map(|i| i.kind()));
+        self
+      }
+
+      /// Add Bring All to Front menu item to the menu.
+      ///
+      /// ## Platform-specific:
+      ///
+      /// - **Windows / Linux:** Unsupported.
+      pub fn bring_all_to_front(mut self) -> Self {
+        self
+          .items
+          .push(PredefinedMenuItem::bring_all_to_front(self.manager, None).map(|i| i.kind()));
+        self
+      }
+
+      /// Add Bring All to Front menu item with specified text to the menu.
+      ///
+      /// ## Platform-specific:
+      ///
+      /// - **Windows / Linux:** Unsupported.
+      pub fn bring_all_to_front_with_text<S: AsRef<str>>(mut self, text: S) -> Self {
+        self.items.push(
+          PredefinedMenuItem::bring_all_to_front(self.manager, Some(text.as_ref()))
+            .map(|i| i.kind()),
+        );
         self
       }
     }

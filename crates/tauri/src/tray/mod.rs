@@ -393,9 +393,8 @@ impl<R: Runtime> TrayIconBuilder<R> {
 ///
 /// This type is reference-counted and the icon is removed when the last instance is dropped.
 ///
-/// See [TrayIconBuilder] to construct this type.
-#[tauri_macros::default_runtime(crate::Wry, wry)]
-pub struct TrayIcon<R: Runtime> {
+/// See [`TrayIconBuilder`] to construct this type.
+pub struct TrayIcon<R: Runtime = crate::DynRuntime> {
   id: TrayIconId,
   inner: tray_icon::TrayIcon,
   app_handle: AppHandle<R>,
@@ -563,6 +562,38 @@ impl<R: Runtime> TrayIcon<R> {
     run_item_main_thread!(self, |self_: Self| {
       self_.inner.set_icon_as_template(is_template)
     })?;
+    Ok(())
+  }
+
+  /// Sets the tray icon and template status atomically. **macOS only**.
+  ///
+  /// On macOS, calling `set_icon` followed by `set_icon_as_template` causes a visible
+  /// flicker as the icon is rendered twice. This method sets both atomically to prevent that.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Linux / Windows:** Falls back to calling `set_icon`.
+  pub fn set_icon_with_as_template(
+    &self,
+    icon: Option<Image<'_>>,
+    #[allow(unused)] is_template: bool,
+  ) -> crate::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+      let tray_icon = match icon {
+        Some(i) => Some(i.try_into()?),
+        None => None,
+      };
+      run_item_main_thread!(self, |self_: Self| {
+        self_
+          .inner
+          .set_icon_with_as_template(tray_icon, is_template)
+      })??;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      self.set_icon(icon)?;
+    }
     Ok(())
   }
 

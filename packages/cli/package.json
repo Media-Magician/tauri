@@ -1,6 +1,6 @@
 {
   "name": "@tauri-apps/cli",
-  "version": "2.10.0",
+  "version": "2.11.4",
   "description": "Command line interface for building Tauri apps",
   "type": "commonjs",
   "funding": {
@@ -41,10 +41,10 @@
     ]
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.4.1",
-    "@types/node": "^24.0.0",
+    "@napi-rs/cli": "3.8.2",
+    "@types/node": "^24.11.0",
     "cross-env": "10.1.0",
-    "vitest": "^4.0.0"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">= 10"
@@ -58,8 +58,9 @@
     "postbuild": "node append-headers.js",
     "build:debug": "cross-env TARGET=node napi build --platform",
     "postbuild:debug": "node append-headers.js",
-    "prepublishOnly": "napi prepublish -t npm --gh-release-id $RELEASE_ID",
+    "prepublishOnly": "napi prepublish -t npm --gh-release-id $RELEASE_ID --skip-optional-publish",
     "prepack": "cp ../../crates/tauri-schema-generator/schemas/config.schema.json .",
+    "postpublish": "node ./postpublish.js",
     "version": "napi version",
     "test": "vitest run",
     "tauri": "node ./tauri.js"

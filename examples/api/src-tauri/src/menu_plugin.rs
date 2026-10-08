@@ -1,7 +1,6 @@
 // Copyright 2019-2024 Tauri Programme within The Commons Conservancy
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
-#![cfg(all(desktop, not(test)))]
 
 use tauri::{
   Runtime, command,
@@ -34,11 +33,12 @@ pub fn toggle<R: tauri::Runtime>(
 }
 
 #[command]
-pub fn popup<R: tauri::Runtime>(
+pub async fn popup<R: tauri::Runtime>(
   window: tauri::Window<R>,
   popup_menu: tauri::State<'_, crate::PopupMenu<R>>,
-) {
+) -> Result<(), ()> {
   window.popup_menu(&popup_menu.0).unwrap();
+  Ok(())
 }
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {

@@ -1,10 +1,10 @@
 {
   "cli.js": {
-    "version": "2.10.0",
+    "version": "2.11.4",
     "node": ">= 10.0.0"
   },
-  "tauri": "2.10.2",
-  "tauri-build": "2.5.5",
-  "tauri-plugin": "2.5.3",
-  "cef": "144.1.0+144.0.7"
+  "tauri": "2.11.5",
+  "tauri-build": "2.6.3",
+  "tauri-plugin": "2.6.3",
+  "tauri-runtime-wry": "2.11.4"
 }

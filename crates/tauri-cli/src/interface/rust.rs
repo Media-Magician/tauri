@@ -30,7 +30,7 @@ use tauri_utils::config::{DeepLinkProtocol, RunnerConfig, Updater, parse::is_con
 use super::{AppSettings, DevProcess, ExitReason};
 use crate::{
   ConfigValue,
-  error::{Context, Error, ErrorExt},
+  error::{Context, Error, ErrorExt, bail},
   helpers::{
     app_paths::Dirs,
     config::{BundleResources, Config, ConfigMetadata, nsis_settings, reload_config, wix_settings},
@@ -42,7 +42,7 @@ mod cargo_config;
 mod desktop;
 pub mod installation;
 pub mod manifest;
-use crate::helpers::config::custom_sign_settings;
+use crate::{helpers::config::custom_sign_settings, runtime::Runtime};
 use cargo_config::Config as CargoConfig;
 use manifest::{Manifest, rewrite_manifest};
 
@@ -147,9 +147,10 @@ impl Rust {
         }
       })
       .unwrap();
+      let manifest_path = tauri_dir.join("Cargo.toml");
       watcher
-        .watch(tauri_dir.join("Cargo.toml"), RecursiveMode::NonRecursive)
-        .with_context(|| format!("failed to watch {}", tauri_dir.join("Cargo.toml").display()))?;
+        .watch(&manifest_path, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch {}", manifest_path.display()))?;
       let (manifest, modified) = rewrite_manifest(config, tauri_dir)?;
       if modified {
         // Wait for the modified event so we don't trigger a re-build later on
@@ -184,12 +185,12 @@ impl Rust {
     self.app_settings.clone()
   }
 
-  pub fn on_before_bundle(&self, options: &Options, dirs: &Dirs) -> crate::Result<()> {
-    self.prepare(options, dirs)
+  #[allow(dead_code)]
+  pub(crate) fn app_settings_ref(&self) -> &RustAppSettings {
+    self.app_settings.as_ref()
   }
 
   pub fn build(&mut self, options: Options, dirs: &Dirs) -> crate::Result<PathBuf> {
-    self.prepare(&options, dirs)?;
     desktop::build(
       options,
       &self.app_settings,
@@ -207,7 +208,6 @@ impl Rust {
     on_exit: F,
     dirs: &Dirs,
   ) -> crate::Result<()> {
-    self.prepare(&options, dirs)?;
     let on_exit = Arc::new(on_exit);
 
     let mut run_args = Vec::new();
@@ -228,7 +228,7 @@ impl Rust {
           on_exit(status, reason);
           tx.send(()).unwrap();
         },
-        dirs.tauri,
+        dirs,
       )?;
 
       rx.recv().unwrap();
@@ -246,7 +246,7 @@ impl Rust {
               options.clone(),
               &run_args,
               move |status, reason| on_exit(status, reason),
-              dirs.tauri,
+              dirs,
             )
             .map(|child| Box::new(child) as Box<dyn DevProcess + Send>)
         },
@@ -308,12 +308,10 @@ impl Rust {
 
   pub fn env(&self) -> HashMap<&str, String> {
     let mut env = HashMap::new();
-    env.insert(
-      "TAURI_ENV_TARGET_TRIPLE",
-      self.app_settings.target_triple.clone(),
-    );
-
     let target_triple = &self.app_settings.target_triple;
+
+    env.insert("TAURI_ENV_TARGET_TRIPLE", target_triple.to_string());
+
     let target_components: Vec<&str> = target_triple.split('-').collect();
     let (arch, host, _host_env) = match target_components.as_slice() {
       // 3 components like aarch64-apple-darwin
@@ -463,7 +461,6 @@ fn dev_options(
         }
       })
       .collect();
-    args.push("--no-default-features".into());
     features.extend(enable_features);
   }
 }
@@ -498,64 +495,7 @@ fn get_watch_folders(
   Ok(watch_folders)
 }
 
-fn ensure_cef_directory_if_needed(
-  app_settings: &RustAppSettings,
-  options: &Options,
-  config_features: Vec<String>,
-  target: Option<&str>,
-  features: &[String],
-  #[allow(unused_variables)] tauri_dir: &Path,
-) -> crate::Result<()> {
-  let mut merged_features = config_features;
-  merged_features.extend(features.to_owned());
-  let no_default_features = options.args.contains(&"--no-default-features".into());
-  if !no_default_features {
-    merged_features.push("default".into());
-  }
-  let enabled_features = app_settings
-    .manifest
-    .lock()
-    .unwrap()
-    .all_enabled_features(&merged_features);
-  let target_triple = target.or_else(|| app_settings.cargo_config.build().target());
-  match crate::cef::exporter::ensure_cef_directory(
-    target_triple,
-    &enabled_features,
-    &app_settings.workspace_dir,
-    options.args.windows(2).find_map(|window| (window[0] == "--archive").then_some(PathBuf::from(window[1].as_str())))
-  ) {
-    // cef not enabled
-    Ok(None) => {}
-    #[cfg(not(windows))]
-    Ok(Some(_cef_dir)) => {
-      let _options = options;
-    }
-    // on Windows we must copy the cef files next to the executable.
-    // We also do this for builds since we can't codesign the global cache.
-    #[cfg(windows)]
-    Ok(Some(cef_dir)) => {
-      let out_dir = app_settings.out_dir(options, tauri_dir)?;
-      crate::helpers::fs::copy_dir_all(&cef_dir, &out_dir)?;
-    }
-    Err(e) => {
-      log::warn!(action = "CEF"; "Failed to ensure CEF directory: {}. Continuing anyway.", e);
-    }
-  }
-  Ok(())
-}
-
 impl Rust {
-  fn prepare(&self, options: &Options, dirs: &Dirs) -> crate::Result<()> {
-    ensure_cef_directory_if_needed(
-      &self.app_settings,
-      options,
-      self.config_features.clone(),
-      options.target.as_deref(),
-      &options.features,
-      dirs.tauri,
-    )
-  }
-
   pub fn build_options(&self, args: &mut Vec<String>, features: &mut Vec<String>, mobile: bool) {
     features.push("tauri/custom-protocol".into());
     if mobile {
@@ -572,17 +512,21 @@ impl Rust {
     options: Options,
     run_args: &[String],
     on_exit: F,
-    tauri_dir: &Path,
+    dirs: &Dirs,
   ) -> crate::Result<desktop::DevChild> {
-    desktop::run_dev(
-      &self.app_settings,
+    let mut targets = self.available_targets.take();
+    let config_features = self.config_features.clone();
+    let result = desktop::run_dev(
+      &*self,
       options,
       run_args,
-      &mut self.available_targets,
-      self.config_features.clone(),
+      &mut targets,
+      config_features,
       on_exit,
-      tauri_dir,
-    )
+      dirs,
+    );
+    self.available_targets = targets;
+    result
   }
 
   fn run_dev_watcher<
@@ -634,43 +578,47 @@ impl Rust {
       }
     }
 
-    loop {
-      if let Ok(events) = rx.recv() {
-        for event in events {
-          if event.kind.is_access() {
-            continue;
-          }
+    while let Ok(events) = rx.recv() {
+      let paths: Vec<PathBuf> = events
+        .into_iter()
+        .filter(|event| !event.kind.is_access())
+        .flat_map(|event| event.event.paths)
+        .filter(|path| !ignore_matcher.is_ignore(path, path.is_dir()))
+        .collect();
 
-          if let Some(event_path) = event.paths.first()
-            && !ignore_matcher.is_ignore(event_path, event_path.is_dir())
-          {
-            if is_configuration_file(self.app_settings.target_platform, event_path)
-              && reload_config(config, merge_configs, dirs.tauri).is_ok()
-            {
-              let (manifest, modified) = rewrite_manifest(config, dirs.tauri)?;
-              if modified {
-                *self.app_settings.manifest.lock().unwrap() = manifest;
-                // no need to run the watcher logic, the manifest was modified
-                // and it will trigger the watcher again
-                continue;
-              }
-            }
-
-            log::info!(
-              "File {} changed. Rebuilding application...",
-              display_path(event_path.strip_prefix(dirs.frontend).unwrap_or(event_path))
-            );
-
-            child.kill().context("failed to kill app process")?;
-
-            // wait for the process to exit
-            // note that on mobile, kill() already waits for the process to exit (duct implementation)
-            let _ = child.wait();
-            child = run(self, config)?;
-          }
+      let config_file_changed = paths
+        .iter()
+        .any(|path| is_configuration_file(self.app_settings.target_platform, path));
+      if config_file_changed && reload_config(config, merge_configs, dirs.tauri).is_ok() {
+        let (manifest, modified) = rewrite_manifest(config, dirs.tauri)?;
+        if modified {
+          *self.app_settings.manifest.lock().unwrap() = manifest;
+          // no need to run the watcher logic, the manifest was modified
+          // and it will trigger the watcher again
+          continue;
         }
       }
+
+      let Some(first_changed_path) = paths.first() else {
+        continue;
+      };
+
+      log::info!(
+        "File {} changed. Rebuilding application...",
+        display_path(
+          first_changed_path
+            .strip_prefix(dirs.frontend)
+            .unwrap_or(first_changed_path)
+        )
+      );
+
+      child.kill().context("failed to kill app process")?;
+      // wait for the process to exit
+      // note that on mobile, kill() already waits for the process to exit (duct implementation)
+      let _ = child.wait();
+      child = run(self, config)?;
     }
+    bail!("File watcher exited unexpectedly")
   }
 }
 
@@ -763,6 +711,24 @@ impl BinarySettings {
   /// The file name without the binary extension (e.g. `.exe`)
   pub fn file_name(&self) -> &str {
     self.filename.as_ref().unwrap_or(&self.name)
+  }
+
+  fn required_features_enabled(&self, enabled_features: &[String]) -> bool {
+    match &self.required_features {
+      Some(req_features) => req_features
+        .iter()
+        .all(|feat| enabled_features.contains(feat)),
+      None => true,
+    }
+  }
+
+  fn matches_src_bin(&self, name: &str, path: &Path) -> bool {
+    self.name == name
+      || self.file_name() == name
+      || self
+        .path
+        .as_ref()
+        .is_some_and(|src_path| path.ends_with(src_path))
   }
 }
 
@@ -937,6 +903,7 @@ impl AppSettings for RustAppSettings {
       config.bundle.clone(),
       updater_settings,
       arch64bits,
+      &options.args,
     )?;
 
     settings.macos.skip_stapling = options.skip_stapling;
@@ -954,25 +921,6 @@ impl AppSettings for RustAppSettings {
         DesktopDeepLinks::List(p) => p,
       });
     }
-
-    if let Some(open) = config.plugins.0.get("shell").and_then(|v| v.get("open"))
-      && (open.as_bool().is_some_and(|x| x) || open.is_string())
-    {
-      settings.appimage.bundle_xdg_open = true;
-    }
-
-    if let Some(deps) = self
-      .manifest
-      .lock()
-      .unwrap()
-      .inner
-      .as_table()
-      .get("dependencies")
-      .and_then(|f| f.as_table())
-      && deps.contains_key("tauri-plugin-opener")
-    {
-      settings.appimage.bundle_xdg_open = true;
-    };
 
     Ok(settings)
   }
@@ -1006,6 +954,7 @@ impl AppSettings for RustAppSettings {
 
   fn get_binaries(&self, options: &Options, tauri_dir: &Path) -> crate::Result<Vec<BundleBinary>> {
     let mut binaries = Vec::new();
+    let mut disabled_bins = Vec::new();
 
     if let Some(bins) = &self.cargo_settings.bin {
       let default_run = self
@@ -1014,14 +963,9 @@ impl AppSettings for RustAppSettings {
         .clone()
         .unwrap_or_default();
       for bin in bins {
-        if let Some(req_features) = &bin.required_features {
-          // Check if all required features are enabled.
-          if !req_features
-            .iter()
-            .all(|feat| options.features.contains(feat))
-          {
-            continue;
-          }
+        if !bin.required_features_enabled(&options.features) {
+          disabled_bins.push(bin);
+          continue;
         }
         let file_name = bin.file_name();
         let is_main = file_name == self.cargo_package_settings.name || file_name == default_run;
@@ -1069,7 +1013,10 @@ impl AppSettings for RustAppSettings {
       let bin_exists = binaries
         .iter()
         .any(|bin| bin.name() == name || path.ends_with(bin.src_path().unwrap_or(&"".to_string())));
-      if !bin_exists {
+      let bin_disabled = disabled_bins
+        .iter()
+        .any(|bin| bin.matches_src_bin(&name, &path));
+      if !bin_exists && !bin_disabled {
         binaries.push(BundleBinary::new(name, false))
       }
     }
@@ -1128,6 +1075,13 @@ impl AppSettings for RustAppSettings {
 }
 
 impl RustAppSettings {
+  /// The webview runtime the app links when built with the given Cargo features.
+  pub fn runtime(&self, features: &[String]) -> Runtime {
+    let manifest = self.manifest.lock().unwrap();
+    let enabled_features = manifest.all_enabled_features(features);
+    manifest.runtime(&enabled_features, &self.target_triple)
+  }
+
   pub fn new(
     config: &Config,
     manifest: Manifest,
@@ -1421,7 +1375,7 @@ pub fn get_profile_dir(options: &Options) -> &str {
   }
 }
 
-#[allow(unused_variables, deprecated)]
+#[allow(unused_variables, deprecated, clippy::too_many_arguments)]
 pub(crate) fn tauri_config_to_bundle_settings(
   settings: &RustAppSettings,
   features: &[String],
@@ -1430,12 +1384,21 @@ pub(crate) fn tauri_config_to_bundle_settings(
   config: crate::helpers::config::BundleConfig,
   updater_config: Option<UpdaterSettings>,
   arch64bits: bool,
+  cargo_args: &[String],
 ) -> crate::Result<BundleSettings> {
   let enabled_features = settings
     .manifest
     .lock()
     .unwrap()
     .all_enabled_features(features);
+  let runtime = settings.runtime(features);
+  let webview_runtime = runtime.bundler_runtime(
+    config.cef.embed,
+    &settings.target_triple,
+    &settings.workspace_dir,
+    &get_cargo_target_dir(cargo_args, tauri_dir)?,
+  )?;
+  let webview_install_mode = runtime.webview_install_mode(config.windows.webview_install_mode);
 
   #[allow(unused_mut)]
   let mut resources = config
@@ -1500,11 +1463,10 @@ pub(crate) fn tauri_config_to_bundle_settings(
       }
     }
 
-    depends_deb.push("libwebkit2gtk-4.1-0".to_string());
-    depends_deb.push("libgtk-3-0".to_string());
-
-    libs.push("libwebkit2gtk-4.1.so.0".into());
-    libs.push("libgtk-3.so.0".into());
+    for dependency in runtime.linux_dependencies() {
+      depends_deb.push(dependency.deb_package.to_string());
+      libs.push(dependency.library.into());
+    }
 
     for lib in libs {
       let mut requires = lib;
@@ -1517,8 +1479,7 @@ pub(crate) fn tauri_config_to_bundle_settings(
 
   #[cfg(windows)]
   {
-    if let crate::helpers::config::WebviewInstallMode::FixedRuntime { path } =
-      &config.windows.webview_install_mode
+    if let crate::helpers::config::WebviewInstallMode::FixedRuntime { path } = &webview_install_mode
     {
       resources.push(path.display().to_string());
     }
@@ -1554,10 +1515,10 @@ pub(crate) fn tauri_config_to_bundle_settings(
     let entitlements = if let Some(user_provided_entitlements) = config.macos.entitlements {
       crate::helpers::plist::merge_plist(vec![
         PathBuf::from(user_provided_entitlements).into(),
-        plist::Value::Dictionary(required_entitlements(tauri_config, &enabled_features)?).into(),
+        plist::Value::Dictionary(required_entitlements(tauri_config, runtime)?).into(),
       ])?
     } else {
-      required_entitlements(tauri_config, &enabled_features)?.into()
+      required_entitlements(tauri_config, runtime)?.into()
     };
 
     Some(tauri_bundler::bundle::Entitlements::Plist(entitlements))
@@ -1694,9 +1655,12 @@ pub(crate) fn tauri_config_to_bundle_settings(
       wix: config.windows.wix.map(wix_settings),
       nsis: config.windows.nsis.map(nsis_settings),
       icon_path: PathBuf::new(),
-      webview_install_mode: config.windows.webview_install_mode,
+      webview_install_mode,
       allow_downgrades: config.windows.allow_downgrades,
       sign_command: config.windows.sign_command.map(custom_sign_settings),
+      minimum_webview2_version: runtime
+        .minimum_webview2_version(config.windows.minimum_webview2_version),
+      bundle_vc_runtime: config.windows.bundle_vc_runtime,
     },
     license: config.license.or_else(|| {
       settings
@@ -1717,13 +1681,7 @@ pub(crate) fn tauri_config_to_bundle_settings(
     }),
     license_file: config.license_file.map(|l| tauri_dir.join(l)),
     updater: updater_config,
-    cef_path: if enabled_features.contains(&"cef".into())
-      || enabled_features.contains(&"tauri/cef".into())
-    {
-      std::env::var_os("CEF_PATH").map(PathBuf::from)
-    } else {
-      None
-    },
+    webview_runtime,
     ..Default::default()
   })
 }
@@ -1731,7 +1689,7 @@ pub(crate) fn tauri_config_to_bundle_settings(
 #[cfg(target_os = "macos")]
 fn required_entitlements(
   tauri_config: &Config,
-  enabled_features: &[String],
+  runtime: Runtime,
 ) -> crate::Result<plist::Dictionary> {
   let mut entitlements = plist::Dictionary::new();
 
@@ -1760,16 +1718,8 @@ fn required_entitlements(
     }
   }
 
-  if enabled_features.contains(&"cef".into()) || enabled_features.contains(&"tauri/cef".into()) {
-    entitlements.insert("com.apple.security.cs.allow-jit".to_string(), true.into());
-    entitlements.insert(
-      "com.apple.security.cs.allow-unsigned-executable-memory".to_string(),
-      true.into(),
-    );
-    entitlements.insert(
-      "com.apple.security.cs.disable-library-validation".to_string(),
-      true.into(),
-    );
+  for (key, value) in runtime.macos_entitlements() {
+    entitlements.insert(key, value);
   }
 
   Ok(entitlements)
@@ -1823,6 +1773,44 @@ mod pkgconfig_utils {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::fs;
+
+  fn app_settings_with_manifest(cargo_toml: &str) -> (tempfile::TempDir, RustAppSettings) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tauri_dir = temp_dir.path().to_path_buf();
+    fs::create_dir_all(tauri_dir.join("src/bin")).unwrap();
+    fs::write(tauri_dir.join("Cargo.toml"), cargo_toml).unwrap();
+    fs::write(tauri_dir.join("src/main.rs"), "").unwrap();
+    fs::write(tauri_dir.join("src/bin/generate-bindings.rs"), "").unwrap();
+
+    let cargo_settings = CargoSettings::load(&tauri_dir).unwrap();
+    let cargo_package_settings = cargo_settings.package.clone().unwrap();
+    let package_settings = PackageSettings {
+      product_name: cargo_package_settings.name.clone(),
+      version: "0.1.0".into(),
+      description: String::new(),
+      homepage: None,
+      authors: None,
+      default_run: cargo_package_settings.default_run.clone(),
+    };
+
+    let target_triple = "x86_64-unknown-linux-gnu".to_string();
+
+    (
+      temp_dir,
+      RustAppSettings {
+        manifest: Mutex::new(Manifest::default()),
+        cargo_settings,
+        cargo_package_settings,
+        cargo_ws_package_settings: None,
+        package_settings,
+        cargo_config: CargoConfig::default(),
+        target_triple: target_triple.clone(),
+        target_platform: TargetPlatform::from_triple(&target_triple),
+        workspace_dir: tauri_dir,
+      },
+    )
+  }
 
   #[test]
   fn parse_cargo_option() {
@@ -1841,6 +1829,41 @@ mod tests {
     assert_eq!(get_cargo_option(&args, "--profile"), Some("holla"));
     assert_eq!(get_cargo_option(&args, "--target-dir"), Some("path/to/dir"));
     assert_eq!(get_cargo_option(&args, "--non-existent"), None);
+  }
+
+  #[test]
+  fn get_binaries_ignores_src_bin_with_disabled_required_features() {
+    let cargo_toml = r#"
+      [package]
+      name = "app"
+      version = "0.1.0"
+      default-run = "app"
+
+      [[bin]]
+      name = "generate-bindings"
+      path = "src/bin/generate-bindings.rs"
+      required-features = ["bindings"]
+    "#;
+
+    let (temp_dir, app_settings) = app_settings_with_manifest(cargo_toml);
+    let tauri_dir = temp_dir.path();
+
+    let binaries = app_settings
+      .get_binaries(&Options::default(), tauri_dir)
+      .unwrap();
+    assert!(binaries.iter().any(|bin| bin.name() == "app" && bin.main()));
+    assert!(!binaries.iter().any(|bin| bin.name() == "generate-bindings"));
+
+    let binaries = app_settings
+      .get_binaries(
+        &Options {
+          features: vec!["bindings".into()],
+          ..Default::default()
+        },
+        tauri_dir,
+      )
+      .unwrap();
+    assert!(binaries.iter().any(|bin| bin.name() == "generate-bindings"));
   }
 
   #[test]

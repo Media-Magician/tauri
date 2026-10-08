@@ -6,37 +6,61 @@
 //! Developers can integrate any front-end framework that compiles to HTML, JS and CSS for building their user interface.
 //! The backend of the application is a rust-sourced binary with an API that the front-end can interact with.
 //!
+//! # Choosing a runtime
+//!
+//! Tauri does not bundle a webview runtime. Add one of the runtime crates to your dependencies and
+//! select it when building the application:
+//!
+//! ```rust,ignore
+//! // using wry (the system webview)
+//! tauri::Builder::default().runtime(tauri_runtime_wry::Wry::default());
+//! ```
+//!
+//! ```rust,ignore
+//! // using CEF (Chromium Embedded Framework)
+//! tauri::Builder::default().runtime(tauri_runtime_cef::Cef::default());
+//! ```
+//!
+//! [`Builder::default`] uses the type-erased [`DynRuntime`], so types such as [`AppHandle`],
+//! [`Window`] and [`Webview`] can be used without naming the runtime. Runtime-specific APIs are
+//! available through extension traits defined by the runtime crates (e.g. `tauri_runtime_wry::AppHandleWryExt`).
+//!
+//! Applications that prefer static dispatch can name the runtime type instead:
+//! `tauri::Builder::<tauri_runtime_wry::WryRuntime>::new()`.
+//!
 //! # Cargo features
 //!
 //! The following are a list of [Cargo features](https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-features-section) that can be enabled or disabled:
 //!
-//! - **wry** *(enabled by default)*: Enables the [wry](https://github.com/tauri-apps/wry) runtime. Only disable it if you want a custom runtime.
-//! - **cef**: Enables the [CEF](https://github.com/chromiumembedded/cef) runtime.
-// - **common-controls-v6** *(enabled by default)*: Enables [Common Controls v6](https://learn.microsoft.com/en-us/windows/win32/controls/common-control-versions) support on Windows, mainly for the predefined `about` menu item.
-//! - **x11** *(enabled by default)*: Enables X11 support. Disable this if you only target Wayland.
+//! - **common-controls-v6** *(enabled by default)*: Enables [Common Controls v6](https://learn.microsoft.com/en-us/windows/win32/controls/common-control-versions) support on Windows, mainly for the predefined `about` menu item.
 //! - **unstable**: Enables unstable features. Be careful, it might introduce breaking changes in future minor releases.
 //! - **tracing**: Enables [`tracing`](https://docs.rs/tracing/latest/tracing) for window startup, plugins, `Window::eval`, events, IPC, updater and custom protocol request handlers.
 //! - **test**: Enables the [`mod@test`] module exposing unit test helpers.
 //! - **objc-exception**: This feature flag is no-op since 2.3.0.
 //! - **linux-libxdo**: Enables linking to libxdo which enables Cut, Copy, Paste and SelectAll menu items to work on Linux.
+//! - **linux-libappindicator**: Uses libappindicator instead of the default ksni (StatusNotifierItem) backend for the tray icon on Linux, adding a runtime dependency on libayatana-appindicator.
+//! - **gtk3**: Selects GTK 3 for the Linux GTK APIs (`Window::gtk_window`, `Window::default_vbox` and the menu integration). Enabled by GTK3 runtime crates such as `tauri-runtime-wry`.
+//! - **gtk4**: Selects GTK 4 for the Linux GTK APIs (`Window::gtk_window`, `Window::default_vbox` and the menu integration). Enabled by GTK4 runtime crates such as `tauri-runtime-cef`.
+//!   Enabling both selects GTK 4, and the GTK APIs then fail with [`Error::GtkVersionMismatch`] under a GTK3 runtime. Link runtime crates that agree on the GTK version: GTK 3 and GTK 4 cannot be initialized in the same process, so a Linux binary can only ever run one of them.
 //! - **isolation**: Enables the isolation pattern. Enabled by default if the `app > security > pattern > use` config option is set to `isolation` on the `tauri.conf.json` file.
 //! - **custom-protocol**: Feature managed by the Tauri CLI. When enabled, Tauri assumes a production environment instead of a development one.
-//! - **devtools**: Enables the developer tools (Web inspector) and [`window::Window#method.open_devtools`]. Enabled by default on debug builds.
+//! - **devtools**: Enables the developer tools (Web inspector) and [`webview::Webview#method.open_devtools`]. Enabled by default on debug builds.
 //!   On macOS it uses private APIs, so you can't enable it if your app will be published to the App Store.
+//!   Enable it on the runtime crate (e.g. `tauri-runtime-wry`) instead, which also enables it here.
 //! - **native-tls**: Provides TLS support to connect over HTTPS.
 //! - **native-tls-vendored**: Compile and statically link to a vendored copy of OpenSSL.
 //! - **rustls-tls**: Provides TLS support to connect over HTTPS using rustls.
 //! - **process-relaunch-dangerous-allow-symlink-macos**: Allows the [`process::current_binary`] function to allow symlinks on macOS (this is dangerous, see the Security section in the documentation website).
 //! - **tray-icon**: Enables application tray icon APIs. Enabled by default if the `trayIcon` config is defined on the `tauri.conf.json` file.
 //! - **macos-private-api**: Enables features only available in **macOS**'s private APIs, currently the `transparent` window functionality and the `fullScreenEnabled` preference setting to `true`. Enabled by default if the `tauri > macosPrivateApi` config flag is set to `true` on the `tauri.conf.json` file.
+//!   Enable it on the runtime crate (e.g. `tauri-runtime-wry`) instead, which also enables it here.
 //! - **webview-data-url**: Enables usage of data URLs on the webview.
 //! - **compression** *(enabled by default): Enables asset compression. You should only disable this if you want faster compile times in release builds - it produces larger binaries.
 //! - **config-json5**: Adds support to JSON5 format for `tauri.conf.json`.
 //! - **config-toml**: Adds support to TOML format for the configuration `Tauri.toml`.
-//! - **image-ico**: Adds support to parse `.ico` image, see [`Image`].
-//! - **image-png**: Adds support to parse `.png` image, see [`Image`].
-//! - **macos-proxy**: Adds support for [`WebviewBuilder::proxy_url`] on macOS. Requires macOS 14+.
-//! - **specta**: Add support for [`specta::specta`](https://docs.rs/specta/%5E2.0.0-rc.9/specta/attr.specta.html) with Tauri arguments such as [`State`](crate::State), [`Window`](crate::Window) and [`AppHandle`](crate::AppHandle)
+//! - **image-ico**: Adds support to parse `.ico` image, see [`image::Image`].
+//! - **image-png**: Adds support to parse `.png` image, see [`image::Image`].
+//! - **specta**: Add support for [`specta::specta`](https://docs.rs/specta/%5E2.0.0-rc.9/specta/attr.specta.html) with Tauri arguments such as [`State`], [`Window`] and [`AppHandle`]
 //! - **dynamic-acl** *(enabled by default)*: Enables you to add ACLs at runtime, notably it enables the [`Manager::add_capability`] function.
 //!
 //! ## Cargo allowlist features
@@ -54,6 +78,23 @@
 )]
 #![warn(missing_docs, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+
+// `gtk3` and `gtk4` are additive cargo features but the crate can only bind one GTK version, so
+// GTK 4 wins when both are enabled - the same precedence muda and tray-icon use. Cargo unifies
+// features, so this is what a build graph containing both a GTK3 runtime (`tauri-runtime-wry`) and
+// a GTK4 one (`tauri-runtime-cef`) resolves to; `Window::gtk_version_matches` then keeps the GTK
+// APIs from handing objects of the wrong version to the bindings compiled here.
+#[cfg(all(
+  any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  ),
+  feature = "gtk4"
+))]
+extern crate gtk4 as gtk;
 
 /// Setups the binding that initializes an iOS plugin.
 #[cfg(target_os = "ios")]
@@ -74,8 +115,6 @@ pub use resources::{Resource, ResourceId, ResourceTable};
 #[cfg(target_os = "ios")]
 #[doc(hidden)]
 pub use swift_rs;
-#[cfg(feature = "cef")]
-pub use tauri_macros::cef_entry_point;
 pub use tauri_macros::include_image;
 #[cfg(mobile)]
 pub use tauri_macros::mobile_entry_point;
@@ -88,6 +127,8 @@ pub(crate) mod app;
 pub mod async_runtime;
 mod error;
 mod event;
+#[cfg(gtk)]
+mod gtk_version;
 pub mod ipc;
 mod manager;
 mod pattern;
@@ -118,98 +159,25 @@ pub use tauri_utils as utils;
 
 pub use http;
 
-/// A Tauri [`Runtime`] wrapper around wry.
-#[cfg(feature = "wry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-pub type Wry = tauri_runtime_wry::Wry<EventLoopMessage>;
-/// A Tauri [`RuntimeHandle`] wrapper around wry.
-#[cfg(feature = "wry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-pub type WryHandle = tauri_runtime_wry::WryHandle<EventLoopMessage>;
+/// The type-erased [`Runtime`], used as the default runtime type of every Tauri type.
+///
+/// The concrete runtime is selected through [`Builder::runtime`]:
+///
+/// ```rust,ignore
+/// tauri::Builder::default()
+///   .runtime(tauri_runtime_wry::Wry::default())
+///   .run(tauri::generate_context!())
+///   .expect("error while running tauri application");
+/// ```
+///
+/// Runtime-specific APIs are exposed through extension traits defined by the runtime crates.
+/// Applications that want static dispatch can use the concrete runtime type instead,
+/// e.g. `tauri::Builder::<tauri_runtime_wry::WryRuntime>::new()`.
+pub type DynRuntime = runtime::dynamic::DynRuntime<EventLoopMessage>;
 
-/// A Tauri [`Runtime`] wrapper around cef.
-#[cfg(feature = "cef")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cef")))]
-pub type Cef = tauri_runtime_cef::CefRuntime<EventLoopMessage>;
-/// A Tauri [`RuntimeHandle`] wrapper around cef.
-#[cfg(feature = "cef")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cef")))]
-pub type CefHandle = tauri_runtime_cef::CefRuntimeHandle<EventLoopMessage>;
-
-/// Helper function for non-browser CEF processes (renderer, GPU, plugin, etc.).
-#[cfg(feature = "cef")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cef")))]
-pub use tauri_runtime_cef::run_cef_helper_process;
-
-/// DevTools protocol message type for the CEF runtime.
-#[cfg(feature = "cef")]
-#[cfg_attr(docsrs, doc(cfg(feature = "cef")))]
-pub use tauri_runtime_cef::DevToolsProtocol as CefDevToolsProtocol;
-
-#[cfg(all(feature = "wry", target_os = "android"))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "wry", target_os = "android"))))]
-#[doc(hidden)]
-#[macro_export]
-macro_rules! android_binding {
-  ($domain:ident, $app_name:ident, $main:ident, $wry:path) => {
-    use $wry::{
-      android_setup,
-      prelude::{JClass, JNIEnv, JString},
-    };
-
-    ::tauri::wry::android_binding!($domain, $app_name, $wry);
-
-    ::tauri::tao::android_binding!(
-      $domain,
-      $app_name,
-      WryActivity,
-      android_setup,
-      $main,
-      ::tauri::tao
-    );
-
-    // be careful when renaming this, the `Java_app_tauri_plugin_PluginManager_handlePluginResponse` symbol is checked by the CLI
-    ::tauri::tao::platform::android::prelude::android_fn!(
-      app_tauri,
-      plugin,
-      PluginManager,
-      handlePluginResponse,
-      [i32, JString, JString],
-    );
-    ::tauri::tao::platform::android::prelude::android_fn!(
-      app_tauri,
-      plugin,
-      PluginManager,
-      sendChannelData,
-      [i64, JString],
-    );
-
-    // this function is a glue between PluginManager.kt > handlePluginResponse and Rust
-    #[allow(non_snake_case)]
-    pub fn handlePluginResponse(
-      mut env: JNIEnv,
-      _: JClass,
-      id: i32,
-      success: JString,
-      error: JString,
-    ) {
-      ::tauri::handle_android_plugin_response(&mut env, id, success, error);
-    }
-
-    // this function is a glue between PluginManager.kt > sendChannelData and Rust
-    #[allow(non_snake_case)]
-    pub fn sendChannelData(mut env: JNIEnv, _: JClass, id: i64, data: JString) {
-      ::tauri::send_channel_data(&mut env, id, data);
-    }
-  };
-}
-
-#[cfg(all(feature = "wry", target_os = "android"))]
+#[cfg(target_os = "android")]
 #[doc(hidden)]
 pub use plugin::mobile::{handle_android_plugin_response, send_channel_data};
-#[cfg(all(feature = "wry", target_os = "android"))]
-#[doc(hidden)]
-pub use tauri_runtime_wry::{tao, wry};
 
 /// A task to run on the main thread.
 pub type SyncTask = Box<dyn FnOnce() + Send>;
@@ -222,10 +190,6 @@ use std::{
   sync::MutexGuard,
 };
 use utils::assets::{AssetKey, CspHash, EmbeddedAssets};
-
-#[cfg(feature = "wry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-pub use tauri_runtime_wry::webview_version;
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
@@ -373,8 +337,7 @@ impl<R: Runtime> Assets<R> for EmbeddedAssets {
 /// # Stability
 /// This is the output of the [`generate_context`] macro, and is not considered part of the stable API.
 /// Unless you know what you are doing and are prepared for this type to have breaking changes, do not create it yourself.
-#[tauri_macros::default_runtime(Wry, wry)]
-pub struct Context<R: Runtime> {
+pub struct Context<R: Runtime = crate::DynRuntime> {
   pub(crate) config: Config,
   #[cfg(dev)]
   pub(crate) config_parent: Option<std::path::PathBuf>,
@@ -667,7 +630,7 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
   ///   storage.store.lock().unwrap().insert(key, value);
   /// }
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .manage(Storage { store: Default::default() })
   ///   .manage(DbConnection { db: Default::default() })
   ///   .invoke_handler(tauri::generate_handler![connect, storage_insert])
@@ -691,10 +654,10 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
   ///
   /// #[tauri::command]
   /// fn string_command<'r>(state: State<'r, MyString>) {
-  ///     println!("state: {}", state.inner().0);
+  ///     println!("state: {}", state.0);
   /// }
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     app.manage(MyInt(0));
   ///     app.manage(MyString("tauri".into()));
@@ -781,13 +744,14 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
 
   /// Gets the managed [`Env`].
   fn env(&self) -> Env {
-    self.state::<Env>().inner().clone()
+    use std::ops::Deref;
+    self.state::<Env>().deref().clone()
   }
 
   /// Gets the scope for the asset protocol.
   #[cfg(feature = "protocol-asset")]
   fn asset_protocol_scope(&self) -> scope::fs::Scope {
-    self.state::<Scopes>().inner().asset_protocol.clone()
+    self.state::<Scopes>().asset_protocol.clone()
   }
 
   /// The path resolver.
@@ -805,7 +769,7 @@ pub trait Manager<R: Runtime>: sealed::ManagerBase<R> {
   /// ```
   /// use tauri::Manager;
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     #[cfg(feature = "beta")]
   ///     app.add_capability(include_str!("../capabilities/beta/cap.json"));
@@ -862,7 +826,7 @@ pub trait Listener<R: Runtime>: sealed::ManagerBase<R> {
   ///   window.emit("synchronized", ());
   /// }
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     app.listen("synchronized", |event| {
   ///       println!("app is in sync");
@@ -892,7 +856,7 @@ pub trait Listener<R: Runtime>: sealed::ManagerBase<R> {
   /// ```
   /// use tauri::{Manager, Listener};
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     let handle = app.handle().clone();
   ///     let handler = app.listen_any("ready", move |event| {
@@ -924,7 +888,7 @@ pub trait Listener<R: Runtime>: sealed::ManagerBase<R> {
   ///   window.emit("synchronized", ());
   /// }
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     app.listen_any("synchronized", |event| {
   ///       println!("app is in sync");
@@ -1089,19 +1053,26 @@ pub(crate) mod sealed {
     fn manager_owned(&self) -> Arc<AppManager<R>>;
     fn runtime(&self) -> RuntimeOrDispatch<'_, R>;
     fn managed_app_handle(&self) -> &AppHandle<R>;
+    #[cfg(target_os = "android")]
+    fn activity_name(&self) -> Option<crate::Result<String>>;
+    #[cfg(target_os = "ios")]
+    fn scene_identifier(&self) -> Option<crate::Result<String>>;
   }
 }
 
+#[cfg(desktop)]
 struct UnsafeSend<T>(T);
+#[cfg(desktop)]
 unsafe impl<T> Send for UnsafeSend<T> {}
 
+#[cfg(desktop)]
 impl<T> UnsafeSend<T> {
   fn take(self) -> T {
     self.0
   }
 }
 
-#[allow(unused)]
+#[cfg(desktop)]
 macro_rules! run_main_thread {
   ($handle:ident, $ex:expr) => {{
     use std::sync::mpsc::channel;
@@ -1116,7 +1087,7 @@ macro_rules! run_main_thread {
   }};
 }
 
-#[allow(unused)]
+#[cfg(desktop)]
 pub(crate) use run_main_thread;
 
 #[cfg(any(test, feature = "test"))]
@@ -1125,34 +1096,34 @@ pub mod test;
 
 #[cfg(feature = "specta")]
 const _: () = {
-  use specta::{TypeMap, datatype::DataType, function::FunctionArg};
+  use specta::{Types, datatype::DataType, function::FunctionArg};
 
   impl<T: Send + Sync + 'static> FunctionArg for crate::State<'_, T> {
-    fn to_datatype(_: &mut TypeMap) -> Option<DataType> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
       None
     }
   }
 
   impl<R: crate::Runtime> FunctionArg for crate::AppHandle<R> {
-    fn to_datatype(_: &mut TypeMap) -> Option<DataType> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
       None
     }
   }
 
   impl<R: crate::Runtime> FunctionArg for crate::Window<R> {
-    fn to_datatype(_: &mut TypeMap) -> Option<DataType> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
       None
     }
   }
 
   impl<R: crate::Runtime> FunctionArg for crate::Webview<R> {
-    fn to_datatype(_: &mut TypeMap) -> Option<DataType> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
       None
     }
   }
 
   impl<R: crate::Runtime> FunctionArg for crate::WebviewWindow<R> {
-    fn to_datatype(_: &mut TypeMap) -> Option<DataType> {
+    fn to_datatype(_: &mut Types) -> Option<DataType> {
       None
     }
   }
@@ -1242,9 +1213,9 @@ mod z85 {
     assert_eq!(bytes.len() % 4, 0);
 
     let mut buf = String::with_capacity(bytes.len() * 5 / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
       let mut chars = [0u8; 5];
-      let mut chunk = u32::from_be_bytes(chunk.try_into().unwrap()) as usize;
+      let mut chunk = u32::from_be_bytes(*chunk) as usize;
       for byte in chars.iter_mut().rev() {
         *byte = TABLE[chunk % 85];
         chunk /= 85;

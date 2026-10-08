@@ -5,7 +5,7 @@
 use std::{
   borrow::Cow,
   io::{Cursor, Read},
-  sync::Arc,
+  sync::{Arc, Mutex},
 };
 
 use cef::{rc::*, *};
@@ -13,32 +13,56 @@ use dioxus_debug_cell::RefCell;
 use html5ever::{LocalName, interface::QualName, namespace_url, ns};
 use http::{
   HeaderMap, HeaderName, HeaderValue,
-  header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+  header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN},
 };
-use kuchiki::NodeRef;
-use tauri_runtime::webview::UriSchemeProtocolHandler;
+use kuchiki::{Attribute, ExpandedName, NodeRef};
+use tauri_runtime::{
+  UserEvent,
+  webview::{NavigationHandler, UriSchemeProtocolHandler},
+  window::WindowId,
+};
 use tauri_utils::{
   config::{Csp, CspDirectiveSources},
   html::{parse as parse_html, serialize_node},
 };
 use url::Url;
 
-use super::CefInitScript;
+use crate::{
+  cef_impl::client::{
+    DragDropEventTarget, DragDropState, WebDragDropResourceRequestHandler,
+    WebDragDropResourceRequestHandlerArgs,
+  },
+  macros::wrap_with_args,
+  runtime::RuntimeContext,
+  webview::{CefInitScript, INITIAL_LOAD_URL},
+};
 
 type HttpResponse = Arc<RefCell<Option<http::Response<Cursor<Vec<u8>>>>>>;
+pub(crate) type SchemeRegistry = Arc<
+  Mutex<
+    std::collections::HashMap<
+      (i32, String),
+      (
+        String,
+        Arc<Box<UriSchemeProtocolHandler>>,
+        Arc<Vec<CefInitScript>>,
+      ),
+    >,
+  >,
+>;
 
 fn csp_inject_initialization_scripts_hashes(
   existing_csp: String,
   initialization_scripts: &[CefInitScript],
+  is_main_frame: bool,
 ) -> String {
   if initialization_scripts.is_empty() {
     return existing_csp;
   }
 
-  // For custom schemes, include ALL script hashes (we inject all scripts into HTML)
-  // This matches the HTML injection behavior in inject_scripts_into_html_body
   let script_hashes: Vec<String> = initialization_scripts
     .iter()
+    .filter(|script| script.runs_in_frame(is_main_frame))
     .map(|s| s.hash.clone())
     .collect();
 
@@ -46,33 +70,27 @@ fn csp_inject_initialization_scripts_hashes(
     return existing_csp;
   }
 
-  // Parse CSP using tauri-utils
   let mut csp_map: std::collections::HashMap<String, CspDirectiveSources> =
     Csp::Policy(existing_csp.to_string()).into();
 
-  // Update or create script-src directive with script hashes
   let script_src = csp_map
     .entry("script-src".to_string())
     .or_insert_with(|| CspDirectiveSources::List(vec!["'self'".to_string()]));
 
-  // Extend with script hashes
   script_src.extend(script_hashes);
 
-  // Convert back to CSP string
   Csp::DirectiveMap(csp_map).to_string()
 }
 
-/// Helper function to inject initialization scripts into HTML body
 fn inject_scripts_into_html_body(
   body: &[u8],
   initialization_scripts: &[CefInitScript],
+  is_main_frame: bool,
 ) -> Option<Vec<u8>> {
-  // Check if body is valid UTF-8 HTML
   let Ok(body_str) = std::str::from_utf8(body) else {
     return None;
   };
 
-  // Parse HTML and inject scripts
   let document = parse_html(body_str.to_string());
 
   let head = if let Ok(ref head_node) = document.select_first("head") {
@@ -86,60 +104,143 @@ fn inject_scripts_into_html_body(
     head_node
   };
 
-  // Inject initialization scripts (for custom schemes, inject all scripts)
-  for init_script in initialization_scripts.iter().rev() {
+  for init_script in initialization_scripts
+    .iter()
+    .rev()
+    .filter(|script| script.runs_in_frame(is_main_frame))
+  {
     let script_el = NodeRef::new_element(QualName::new(None, ns!(html), "script".into()), None);
-    script_el.append(NodeRef::new_text(init_script.script.script.as_str()));
+    script_el.append(NodeRef::new_text(init_script.script.as_str()));
     head.prepend(script_el);
   }
 
-  // Serialize the modified HTML
+  keep_encoding_declaration_first(&document, &head);
+
   Some(serialize_node(&document))
 }
 
-wrap_resource_request_handler! {
-  pub struct WebResourceRequestHandler {
-    initialization_scripts: Arc<Vec<CefInitScript>>,
-  }
+/// Keeps the document's character encoding declaration ahead of the injected scripts.
+///
+/// Chromium only pre-scans the first 1024 bytes of a document for a `<meta charset>`
+/// declaration. The initialization scripts we prepend to `<head>` are much larger than
+/// that, so an encoding declaration that used to be in the pre-scan window ends up out
+/// of reach and the document is decoded with the fallback encoding (windows-1252)
+/// instead. That mojibakes every non-ASCII byte in the page and in the injected scripts,
+/// which additionally breaks the CSP hashes we compute over the UTF-8 source, so the
+/// browser refuses to execute the affected script.
+fn keep_encoding_declaration_first(document: &NodeRef, head: &NodeRef) {
+  let existing_declaration = document.select("meta").ok().and_then(|metas| {
+    metas.into_iter().find(|meta| {
+      let attributes = meta.attributes.borrow();
+      attributes.get("charset").is_some()
+        || attributes
+          .get("http-equiv")
+          .map(|value| value.trim().eq_ignore_ascii_case("content-type"))
+          .unwrap_or(false)
+    })
+  });
 
-  impl ResourceRequestHandler {
-
-
-    fn on_before_resource_load(
-      &self,
-      _browser: Option<&mut Browser>,
-      _frame: Option<&mut Frame>,
-      _request: Option<&mut Request>,
-      _callback: Option<&mut Callback>,
-    ) -> ReturnValue {
-      sys::cef_return_value_t::RV_CONTINUE.into()
+  match existing_declaration {
+    // the document declares its encoding, move that declaration back into the pre-scan window
+    Some(declaration) => {
+      let node = declaration.as_node().clone();
+      node.detach();
+      head.prepend(node);
     }
+    // no declaration at all: the assets are served as UTF-8 (this handler parses them as
+    // such), so make that explicit instead of leaving it to the fallback encoding
+    None => head.prepend(NodeRef::new_element(
+      QualName::new(None, ns!(html), LocalName::from("meta")),
+      [(
+        ExpandedName::new(ns!(), LocalName::from("charset")),
+        Attribute {
+          prefix: None,
+          value: "utf-8".into(),
+        },
+      )],
+    )),
   }
 }
 
-wrap_request_handler! {
-  pub struct WebRequestHandler {
-    initialization_scripts: Arc<Vec<CefInitScript>>,
-    navigation_handler: Option<Arc<tauri_runtime::webview::NavigationHandler>>,
+wrap_with_args! {
+  wrap_request_handler => WebRequestHandlerArgs;
+
+  pub struct WebRequestHandler<T: UserEvent> {
+    navigation_handler: Option<Arc<NavigationHandler>>,
+    frame_event_handler: Option<Arc<crate::FrameEventHandler>>,
+    context: RuntimeContext<T>,
+    window_id: WindowId,
+    webview_id: u32,
+    drag_drop_event_target: DragDropEventTarget,
+    drag_drop_handler_enabled: bool,
+    drag_drop_state: Arc<Mutex<DragDropState>>,
+    web_content_process_terminate_handler: Option<Arc<tauri_runtime::webview::OnWebContentProcessTerminateHandler>>,
+    certificate_errors: crate::CertificateErrorPolicy,
   }
 
   impl RequestHandler {
-    fn on_before_browse(
+    /// Answers a TLS certificate that does not validate, per
+    /// [`CertificateErrorPolicy`](crate::CertificateErrorPolicy).
+    ///
+    /// Returning 0 hands the error back to Chromium, which shows the SSL interstitial
+    /// with its "proceed anyway" link. Cancelling instead means dropping the callback
+    /// without continuing it: CEF reads a `false` return as "cancel this request", and
+    /// the page gets a network error it cannot click past.
+    fn on_certificate_error(
       &self,
       _browser: Option<&mut Browser>,
+      cert_error: Errorcode,
+      request_url: Option<&CefString>,
+      _ssl_info: Option<&mut Sslinfo>,
+      _callback: Option<&mut Callback>,
+    ) -> ::std::os::raw::c_int {
+      match self.certificate_errors {
+        crate::CertificateErrorPolicy::ChromeInterstitial => 0,
+        crate::CertificateErrorPolicy::Cancel => {
+          // The URL can carry credentials and tokens, so only its origin is logged.
+          let origin = request_url
+            .map(ToString::to_string)
+            .and_then(|url| url::Url::parse(&url).ok())
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|| "an unknown origin".to_string());
+          log::warn!(
+            "cancelling a request to {origin}: its TLS certificate did not validate \
+             (Chromium error {cert_error:?}), and the runtime is set to \
+             CertificateErrorPolicy::Cancel"
+          );
+          1
+        }
+      }
+    }
+    fn on_render_process_terminated(
+      &self,
+      browser: Option<&mut Browser>,
+      status: TerminationStatus,
+      error_code: ::std::os::raw::c_int,
+      error_string: Option<&CefString>,
+    ) {
+      let mut frame = browser.as_ref().and_then(|browser| browser.main_frame());
+      crate::frame::emit_frame_event(&self.frame_event_handler, browser, frame.as_mut(), crate::FrameEventKind::RendererTerminated);
+      if let Some(handler) = &self.web_content_process_terminate_handler {
+        handler(tauri_runtime::webview::WebContentProcessTermination {
+          reason: termination_reason(status),
+          error_code: Some(error_code),
+          error_string: error_string.map(ToString::to_string),
+        });
+      }
+    }
+
+    fn on_before_browse(
+      &self,
+      browser: Option<&mut Browser>,
       frame: Option<&mut Frame>,
       request: Option<&mut Request>,
       _user_gesture: ::std::os::raw::c_int,
       _is_redirect: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int {
+      let _ = (&self.context, self.window_id, self.webview_id);
+
       let Some(frame) = frame else {
-        return 0;
-      };
-      // we only fire main frame navigation events to match the behavior of the wry runtime
-      if frame.is_main() == 0 {
-        return 0;
-      }
-      let Some(handler) = &self.navigation_handler else {
         return 0;
       };
       let Some(request) = request else {
@@ -147,15 +248,29 @@ wrap_request_handler! {
       };
 
       let url_str = CefString::from(&request.url()).to_string();
+
+      if url_str == INITIAL_LOAD_URL {
+        return 0;
+      }
+
       let Ok(url) = url::Url::parse(&url_str) else {
         return 0;
       };
-      let should_navigate = handler(&url);
-      if should_navigate {
-        0
-      } else {
-        1
+
+      // Preserve the portable main-frame policy. Native observers receive only
+      // admitted navigations, so a denied navigation cannot strand their barrier.
+      if frame.is_main() != 0
+        && self.navigation_handler.as_ref().is_some_and(|handler| !handler(&url))
+      {
+        return 1;
       }
+      crate::frame::emit_frame_event(
+        &self.frame_event_handler,
+        browser,
+        Some(frame),
+        crate::FrameEventKind::NavigationStarted { url },
+      );
+      0
     }
 
     fn resource_request_handler(
@@ -168,18 +283,48 @@ wrap_request_handler! {
       _request_initiator: Option<&CefString>,
       _disable_default_handling: Option<&mut ::std::os::raw::c_int>,
     ) -> Option<ResourceRequestHandler> {
-      Some(WebResourceRequestHandler::new(
-        self.initialization_scripts.clone(),
+      // The handler only intercepts the drag-drop bridge requests; when the
+      // bridge is disabled it would pass every request straight through, so skip
+      // building (and cloning the context + state into) a handler that CEF calls
+      // for every subresource/fetch/XHR the page makes.
+      if !self.drag_drop_handler_enabled {
+        return None;
+      }
+
+      Some(WebDragDropResourceRequestHandler::build(
+        WebDragDropResourceRequestHandlerArgs {
+          context: self.context.clone(),
+          window_id: self.window_id,
+          webview_id: self.webview_id,
+          drag_drop_event_target: self.drag_drop_event_target,
+          drag_drop_handler_enabled: self.drag_drop_handler_enabled,
+          drag_drop_state: self.drag_drop_state.clone(),
+        },
       ))
     }
   }
 }
 
-wrap_resource_handler! {
+wrap_with_args! {
+  wrap_resource_handler => WebResourceHandlerArgs;
+
   pub struct WebResourceHandler {
     webview_label: String,
     handler: Arc<Box<UriSchemeProtocolHandler>>,
     initialization_scripts: Arc<Vec<CefInitScript>>,
+    // Whether the document this response is loaded into is the main frame. Scripts flagged
+    // `for_main_frame_only` are skipped for subframes - the isolation iframe most notably -
+    // matching both the wry runtime and the guard in the document-start script we register
+    // over CDP for documents that are not served by a custom protocol.
+    is_main_frame: bool,
+    // Serialized origin of the main frame that initiated this request, captured
+    // browser-side in the scheme handler factory. The renderer can issue an IPC
+    // request before its execution context is fully wired to the loader; in
+    // that window Chromium tags the request with `Origin: null` even though the
+    // document already has a proper origin. We use this to repair the `Origin`
+    // header in that case. `None` when the initiator is not the (non-opaque)
+    // main frame, so sandboxed/subframe `Origin: null` requests are left as-is.
+    initiator_origin: Option<String>,
     // we clone response to send it to the handler thread
     response: HttpResponse,
     url: Option<String>,
@@ -201,40 +346,37 @@ wrap_resource_handler! {
         let callback = ThreadSafe(callback.clone());
         let response_store = ThreadSafe(self.response.clone());
         let initialization_scripts = self.initialization_scripts.clone();
+        let is_main_frame = self.is_main_frame;
         let responder = Box::new(move |response: http::Response<Cow<'static, [u8]>>| {
-          // Check if this is an HTML response that needs script injection
-          let content_type = response.headers().get(CONTENT_TYPE);
-          let is_html = content_type
+          let is_html = response
+            .headers()
+            .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .map(|ct| ct.to_lowercase().starts_with("text/html"))
             .unwrap_or(false);
 
           let (parts, body) = response.into_parts();
           let body_bytes = body.into_owned();
-
-          let modified_body = if is_html {
-            inject_scripts_into_html_body(&body_bytes, &initialization_scripts)
+          let body_bytes = if is_html {
+            inject_scripts_into_html_body(&body_bytes, &initialization_scripts, is_main_frame)
               .unwrap_or(body_bytes)
           } else {
             body_bytes
           };
 
-          let mut response = http::Response::from_parts(parts, Cursor::new(modified_body));
+          let mut response = http::Response::from_parts(parts, Cursor::new(body_bytes));
 
-
-          let csp = response
-            .headers_mut()
-            .get_mut(CONTENT_SECURITY_POLICY);
-
-          if let Some(csp) = csp {
-            let csp_string = csp.to_str().unwrap().to_string();
+          if let Some(csp) = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY) {
+            let csp_string = csp.to_str().unwrap_or_default().to_string();
             let new_csp = csp_inject_initialization_scripts_hashes(
               csp_string,
               &initialization_scripts,
+              is_main_frame,
             );
-            *csp = HeaderValue::from_str(&new_csp).unwrap();
+            if let Ok(new_csp) = HeaderValue::from_str(&new_csp) {
+              *csp = new_csp;
+            }
           }
-
 
           response_store.into_owned().borrow_mut().replace(response);
 
@@ -246,10 +388,27 @@ wrap_resource_handler! {
         let handler = self.handler.clone();
 
         let data = read_request_body(request);
-        let headers = get_request_headers(request);
+        let mut headers = get_request_headers(request);
+
+        // The renderer can issue an IPC request before its execution context is
+        // fully wired to the loader; in that window Chromium sends the request
+        // with `Origin: null` even though the document already has a real
+        // origin. Repair it from the initiating main frame's URL, which the
+        // browser process tracks reliably. Only done when the renderer sent no
+        // origin or a literal `null`, so a correct renderer-sent origin always
+        // wins.
+        if let Some(initiator_origin) = &self.initiator_origin {
+          let origin_missing_or_null = headers
+            .get(ORIGIN)
+            .map(|value| value.as_bytes() == b"null")
+            .unwrap_or(true);
+          if origin_missing_or_null && let Ok(value) = HeaderValue::from_str(initiator_origin) {
+            headers.insert(ORIGIN, value);
+          }
+        }
+
         let method_str = CefString::from(&request.method()).to_string();
-        let method = http::Method::from_bytes(method_str.as_bytes())
-          .unwrap_or(http::Method::GET);
+        let method = http::Method::from_bytes(method_str.as_bytes()).unwrap_or(http::Method::GET);
 
         let origin = self.url.as_ref().and_then(|url| Url::parse(url).ok()).and_then(|url| {
           let origin = url.origin();
@@ -261,7 +420,11 @@ wrap_resource_handler! {
         });
 
         std::thread::spawn(move || {
-          let mut http_request = http::Request::builder().method(method).uri(url.as_str()).body(data).unwrap();
+          let mut http_request = http::Request::builder()
+            .method(method)
+            .uri(url.as_str())
+            .body(data)
+            .unwrap();
           *http_request.headers_mut() = headers;
           if let Some(origin) = origin {
             if let Ok(value) = HeaderValue::from_str(&origin) {
@@ -288,7 +451,12 @@ wrap_resource_handler! {
         return 0;
       };
       let data_out = unsafe { std::slice::from_raw_parts_mut(data_out, bytes_to_read) };
-      let count = self.response.borrow_mut().as_mut().and_then(|response| response.body_mut().read(data_out).ok()).unwrap_or(0);
+      let count = self
+        .response
+        .borrow_mut()
+        .as_mut()
+        .and_then(|response| response.body_mut().read(data_out).ok())
+        .unwrap_or(0);
       if let Some(bytes_read) = bytes_read {
         let Ok(count) = count.try_into() else {
           return 0;
@@ -307,14 +475,18 @@ wrap_resource_handler! {
       response_length: Option<&mut i64>,
       redirect_url: Option<&mut CefString>,
     ) {
-      let (Some(response), Some(response_data)) = (response, &*self.response.borrow()) else { return };
+      let (Some(response), Some(response_data)) = (response, &*self.response.borrow()) else {
+        return;
+      };
 
       response.set_status(response_data.status().as_u16() as i32);
       let mut content_type = None;
 
-      // First pass: collect CSP header and set other headers
+      // Set response headers and remember the MIME type for CEF.
       for (name, value) in response_data.headers() {
-        let Ok(value) = value.to_str() else { continue; };
+        let Ok(value) = value.to_str() else {
+          continue;
+        };
 
         response.set_header_by_name(Some(&name.as_str().into()), Some(&value.into()), 0);
 
@@ -323,11 +495,7 @@ wrap_resource_handler! {
         }
       }
 
-      response.set_header_by_name(
-        Some(&"Cache-Control".into()),
-        Some(&"no-store".into()),
-        1,
-      );
+      response.set_header_by_name(Some(&"Cache-Control".into()), Some(&"no-store".into()), 1);
 
       let mime_type = content_type
         .as_ref()
@@ -336,7 +504,9 @@ wrap_resource_handler! {
         .unwrap_or("text/plain");
       response.set_mime_type(Some(&mime_type.into()));
 
-      if let Some(length) = response_length { *length = -1; }
+      if let Some(length) = response_length {
+        *length = -1;
+      }
 
       if let Some(redirect_url) = redirect_url {
         let _ = std::mem::take(redirect_url);
@@ -347,7 +517,7 @@ wrap_resource_handler! {
 
 wrap_scheme_handler_factory! {
   pub struct UriSchemeHandlerFactory {
-    registry: super::SchemeHandlerRegistry,
+    registry: SchemeRegistry,
     scheme: String,
   }
 
@@ -355,24 +525,70 @@ wrap_scheme_handler_factory! {
     fn create(
       &self,
       browser: Option<&mut Browser>,
-      _frame: Option<&mut Frame>,
+      frame: Option<&mut Frame>,
       _scheme_name: Option<&CefString>,
       _request: Option<&mut Request>,
     ) -> Option<ResourceHandler> {
-      let browser = browser?;
-      let id = browser.identifier();
+      let (webview_label, handler, initialization_scripts) = match browser {
+        Some(browser) => {
+          let id = browser.identifier();
 
-      // get handler from our regsitry based on browser ID and scheme
-      let (webview_label, handler, initialization_scripts) = self
-        .registry
-        .lock()
-        .unwrap()
-        .get(&(id, self.scheme.clone()))
-        .cloned()?;
-      
-      let url = _frame.map(|f| f.url()).map(|url| CefString::from(&url).to_string());
+          // get handler from our regsitry based on browser ID and scheme
+          self
+            .registry
+            .lock()
+            .unwrap()
+            .get(&(id, self.scheme.clone()))
+            .cloned()?
+        }
+        // `browser`/`frame` are null for requests that do not originate from a
+        // browser: service worker (main script and update) fetches and
+        // CefURLRequest. Returning `None` here would fall through to the
+        // network service, where `{scheme}.localhost` resolves to loopback and
+        // the connection is refused — which is exactly how service worker
+        // registration on a custom-protocol origin used to fail with "An
+        // unknown error occurred when fetching the script.".
+        //
+        // Every registry entry for a given scheme wraps the same app-level
+        // `UriSchemeProtocolHandler`, so any live entry can serve the request;
+        // only the webview label differs, and asset serving does not depend on
+        // it. Initialization scripts are per-document injections, meaningless
+        // without a browser, so they are not applied on this path.
+        None => {
+          let (webview_label, handler, _) = self
+            .registry
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|((_, scheme), _)| *scheme == self.scheme)
+            .map(|(_, entry)| entry.clone())?;
+          (webview_label, handler, Arc::new(Vec::new()))
+        }
+      };
 
-      Some(WebResourceHandler::new(webview_label, handler, initialization_scripts, Arc::new(RefCell::new(None)), url))
+      // A subframe navigation is the only case we can positively identify here, so anything
+      // else (a null frame included) keeps the main frame behavior of injecting everything.
+      let is_main_frame = frame.as_ref().map(|frame| frame.is_main() == 1).unwrap_or(true);
+
+      // Capture the initiating main frame's origin so `process_request` can
+      // repair a racy `Origin: null` header. Restricted to the main frame: it
+      // is never an opaque-origin (sandboxed) document in a Tauri webview, so
+      // upgrading its origin is safe; subframes are intentionally left alone.
+      let initiator_origin = frame
+        .filter(|frame| frame.is_main() == 1)
+        .map(|frame| CefString::from(&frame.url()).to_string())
+        .and_then(|url| Url::parse(&url).ok())
+        .map(|url| url.origin().ascii_serialization())
+        .filter(|origin| origin != "null");
+
+      Some(WebResourceHandler::build(WebResourceHandlerArgs {
+        webview_label,
+        handler,
+        initialization_scripts,
+        is_main_frame,
+        initiator_origin,
+        response: Arc::new(RefCell::new(None)),
+      }))
     }
   }
 }
@@ -446,4 +662,45 @@ fn get_request_headers(request: &mut Request) -> HeaderMap {
   }
 
   headers
+}
+
+// ==== Renderer termination boundary ====
+
+fn termination_reason(
+  status: TerminationStatus,
+) -> tauri_runtime::webview::WebContentProcessTerminationReason {
+  use tauri_runtime::webview::WebContentProcessTerminationReason as Reason;
+  match status {
+    TerminationStatus::ABNORMAL_TERMINATION => Reason::Abnormal,
+    TerminationStatus::PROCESS_WAS_KILLED => Reason::Killed,
+    TerminationStatus::PROCESS_CRASHED => Reason::Crashed,
+    TerminationStatus::PROCESS_OOM => Reason::OutOfMemory,
+    TerminationStatus::LAUNCH_FAILED => Reason::LaunchFailed,
+    TerminationStatus::INTEGRITY_FAILURE => Reason::IntegrityFailure,
+    _ => Reason::Unknown,
+  }
+}
+
+#[cfg(test)]
+mod termination_tests {
+  use super::*;
+  use tauri_runtime::webview::WebContentProcessTerminationReason as Reason;
+
+  #[test]
+  fn preserves_every_cef_termination_reason() {
+    for (status, expected) in [
+      (TerminationStatus::ABNORMAL_TERMINATION, Reason::Abnormal),
+      (TerminationStatus::PROCESS_WAS_KILLED, Reason::Killed),
+      (TerminationStatus::PROCESS_CRASHED, Reason::Crashed),
+      (TerminationStatus::PROCESS_OOM, Reason::OutOfMemory),
+      (TerminationStatus::LAUNCH_FAILED, Reason::LaunchFailed),
+      (
+        TerminationStatus::INTEGRITY_FAILURE,
+        Reason::IntegrityFailure,
+      ),
+      (TerminationStatus::NUM_VALUES, Reason::Unknown),
+    ] {
+      assert_eq!(termination_reason(status), expected);
+    }
+  }
 }

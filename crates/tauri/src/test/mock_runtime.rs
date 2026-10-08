@@ -7,8 +7,8 @@
 
 use tauri_runtime::{
   DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Icon, ProgressBarState,
-  Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, UserAttentionType, UserEvent,
-  WebviewDispatch, WindowDispatch, WindowEventId,
+  Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, RuntimeInitAttrs, UserAttentionType,
+  UserEvent, WebviewDispatch, WindowDispatch, WindowEventId,
   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
   webview::{DetachedWebview, PendingWebview},
@@ -58,6 +58,7 @@ pub struct RuntimeContext {
   windows: Arc<RefCell<HashMap<WindowId, Window>>>,
   shortcuts: Arc<Mutex<ShortcutMap>>,
   run_tx: SyncSender<Message>,
+  main_thread_id: std::thread::ThreadId,
   next_window_id: Arc<AtomicU32>,
   next_webview_id: Arc<AtomicU32>,
   next_window_event_id: Arc<AtomicU32>,
@@ -74,6 +75,12 @@ unsafe impl Sync for RuntimeContext {}
 
 impl RuntimeContext {
   fn send_message(&self, message: Message) -> Result<()> {
+    if std::thread::current().id() == self.main_thread_id
+      && let Message::Task(task) = message
+    {
+      task();
+      return Ok(());
+    }
     if self.is_running.load(Ordering::Relaxed) {
       self
         .run_tx
@@ -144,6 +151,14 @@ impl<T: UserEvent> RuntimeHandle<T> for MockRuntimeHandle {
     unimplemented!()
   }
 
+  fn custom_scheme_url(&self, scheme: &str, _https: bool) -> String {
+    format!("{scheme}://localhost")
+  }
+
+  fn webview_version(&self) -> Result<String> {
+    Ok("0.0.0".into())
+  }
+
   /// Create a new webview window.
   fn create_window<F: Fn(RawWindow<'_>) + Send + 'static>(
     &self,
@@ -166,17 +181,21 @@ impl<T: UserEvent> RuntimeHandle<T> for MockRuntimeHandle {
       },
     );
 
-    let webview = webview_id.map(|id| DetachedWindowWebview {
-      webview: DetachedWebview {
-        label: pending.label.clone(),
-        dispatcher: MockWebviewDispatcher {
-          id,
-          context: self.context.clone(),
-          url: Arc::new(Mutex::new(pending.webview.unwrap().url)),
-          last_evaluated_script: Default::default(),
+    let webview = webview_id.map(|id| {
+      let w = pending.webview.as_ref().unwrap();
+      DetachedWindowWebview {
+        webview: DetachedWebview {
+          label: pending.label.clone(),
+          dispatcher: MockWebviewDispatcher {
+            id,
+            context: self.context.clone(),
+            url: Arc::new(Mutex::new(w.url.clone())),
+            last_evaluated_script: Default::default(),
+          },
         },
-      },
-      use_https_scheme: false,
+        use_https_scheme: false,
+        devtools: w.webview_attributes.devtools,
+      }
     });
 
     Ok(DetachedWindow {
@@ -242,15 +261,15 @@ impl<T: UserEvent> RuntimeHandle<T> for MockRuntimeHandle {
     unimplemented!();
   }
 
-  fn primary_monitor(&self) -> Option<Monitor> {
+  fn primary_monitor(&self) -> Result<Option<Monitor>> {
     unimplemented!()
   }
 
-  fn monitor_from_point(&self, x: f64, y: f64) -> Option<Monitor> {
+  fn monitor_from_point(&self, x: f64, y: f64) -> Result<Option<Monitor>> {
     unimplemented!()
   }
 
-  fn available_monitors(&self) -> Vec<Monitor> {
+  fn available_monitors(&self) -> Result<Vec<Monitor>> {
     unimplemented!()
   }
 
@@ -287,7 +306,9 @@ impl<T: UserEvent> RuntimeHandle<T> for MockRuntimeHandle {
   #[cfg(target_os = "android")]
   fn run_on_android_context<F>(&self, f: F)
   where
-    F: FnOnce(&mut jni::JNIEnv, &jni::objects::JObject, &jni::objects::JObject) + Send + 'static,
+    F: FnOnce(&mut jni::JNIEnv<'_>, &jni::objects::JObject<'_>, &jni::objects::JObject<'_>)
+      + Send
+      + 'static,
   {
     todo!()
   }
@@ -464,6 +485,10 @@ impl WindowBuilder for MockWindowBuilder {
     self
   }
 
+  fn no_redirection_bitmap(self, enable: bool) -> Self {
+    self
+  }
+
   fn shadow(self, enable: bool) -> Self {
     self
   }
@@ -490,7 +515,7 @@ impl WindowBuilder for MockWindowBuilder {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn transient_for(self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self {
+  fn transient_for(self, parent: *mut std::ffi::c_void) -> Self {
     self
   }
 
@@ -534,6 +559,21 @@ impl WindowBuilder for MockWindowBuilder {
   fn background_color(self, _color: tauri_utils::config::Color) -> Self {
     self
   }
+
+  #[cfg(target_os = "android")]
+  fn activity_name<S: Into<String>>(self, _class_name: S) -> Self {
+    self
+  }
+
+  #[cfg(target_os = "android")]
+  fn created_by_activity_name<S: Into<String>>(self, _class_name: S) -> Self {
+    self
+  }
+
+  #[cfg(target_os = "ios")]
+  fn requested_by_scene_identifier<S: Into<String>>(self, _identifier: S) -> Self {
+    self
+  }
 }
 
 impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
@@ -550,17 +590,22 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
     self.context.next_window_event_id()
   }
 
-  fn with_webview<F: FnOnce(Box<dyn std::any::Any>) + Send + 'static>(&self, f: F) -> Result<()> {
+  fn with_webview<F: FnOnce(()) + Send + 'static>(&self, _f: F) -> Result<()> {
     Ok(())
   }
 
-  #[cfg(any(debug_assertions, feature = "devtools"))]
+  #[cfg(target_os = "ios")]
+  fn with_ios_webview<F: FnOnce(tauri_runtime::webview::IosWebviewHandle) + Send + 'static>(
+    &self,
+    _f: F,
+  ) -> Result<()> {
+    Ok(())
+  }
+
   fn open_devtools(&self) {}
 
-  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn close_devtools(&self) {}
 
-  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn is_devtools_open(&self) -> Result<bool> {
     Ok(false)
   }
@@ -570,6 +615,19 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
   }
 
   fn eval_script<S: Into<String>>(&self, script: S) -> Result<()> {
+    self
+      .last_evaluated_script
+      .lock()
+      .unwrap()
+      .replace(script.into());
+    Ok(())
+  }
+
+  fn eval_script_with_callback<S: Into<String>>(
+    &self,
+    script: S,
+    callback: impl Fn(String) + Send + 'static,
+  ) -> Result<()> {
     self
       .last_evaluated_script
       .lock()
@@ -797,7 +855,7 @@ impl<T: UserEvent> WindowDispatch<T> for MockWindowDispatcher {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn gtk_window(&self) -> Result<gtk::ApplicationWindow> {
+  fn gtk_window(&self) -> Result<*mut std::ffi::c_void> {
     unimplemented!()
   }
 
@@ -808,7 +866,17 @@ impl<T: UserEvent> WindowDispatch<T> for MockWindowDispatcher {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn default_vbox(&self) -> Result<gtk::Box> {
+  fn default_vbox(&self) -> Result<*mut std::ffi::c_void> {
+    unimplemented!()
+  }
+
+  #[cfg(target_os = "android")]
+  fn activity_name(&self) -> Result<String> {
+    unimplemented!()
+  }
+
+  #[cfg(target_os = "ios")]
+  fn scene_identifier(&self) -> Result<String> {
     unimplemented!()
   }
 
@@ -870,17 +938,21 @@ impl<T: UserEvent> WindowDispatch<T> for MockWindowDispatcher {
       },
     );
 
-    let webview = webview_id.map(|id| DetachedWindowWebview {
-      webview: DetachedWebview {
-        label: pending.label.clone(),
-        dispatcher: MockWebviewDispatcher {
-          id,
-          context: self.context.clone(),
-          url: Arc::new(Mutex::new(pending.webview.unwrap().url)),
-          last_evaluated_script: Default::default(),
+    let webview = webview_id.map(|id| {
+      let w = pending.webview.as_ref().unwrap();
+      DetachedWindowWebview {
+        webview: DetachedWebview {
+          label: pending.label.clone(),
+          dispatcher: MockWebviewDispatcher {
+            id,
+            context: self.context.clone(),
+            url: Arc::new(Mutex::new(w.url.clone())),
+            last_evaluated_script: Default::default(),
+          },
         },
-      },
-      use_https_scheme: false,
+        use_https_scheme: false,
+        devtools: w.webview_attributes.devtools,
+      }
     });
 
     Ok(DetachedWindow {
@@ -1139,6 +1211,7 @@ impl MockRuntime {
       windows: Default::default(),
       shortcuts: Default::default(),
       run_tx: tx,
+      main_thread_id: std::thread::current().id(),
       next_window_id: Default::default(),
       next_webview_id: Default::default(),
       next_window_event_id: Default::default(),
@@ -1152,16 +1225,31 @@ impl MockRuntime {
   }
 }
 
+/// Selects the [`MockRuntime`], e.g. `tauri::Builder::default().runtime(MockRuntimeInitAttrs::default())`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MockRuntimeInitAttrs {}
+
+impl<T: UserEvent> RuntimeInitAttrs<T> for MockRuntimeInitAttrs {
+  type Runtime = MockRuntime;
+}
+
+impl<T: UserEvent> From<MockRuntimeInitAttrs> for tauri_runtime::dynamic::DynRuntimeInitAttrs<T> {
+  fn from(attrs: MockRuntimeInitAttrs) -> Self {
+    Self::new(attrs)
+  }
+}
+
 impl<T: UserEvent> Runtime<T> for MockRuntime {
   type WindowDispatcher = MockWindowDispatcher;
   type WebviewDispatcher = MockWebviewDispatcher;
   type Handle = MockRuntimeHandle;
   type EventLoopProxy = EventProxy;
-  type PlatformSpecificWebviewAttribute = ();
-  type PlatformSpecificInitAttribute = ();
+  type RuntimeWebviewAttributes = ();
+  type RuntimeInitAttrs = MockRuntimeInitAttrs;
   type WindowOpener = ();
+  type Webview = ();
 
-  fn new(_args: RuntimeInitArgs<()>) -> Result<Self> {
+  fn new(_args: RuntimeInitArgs<MockRuntimeInitAttrs>) -> Result<Self> {
     Ok(Self::init())
   }
 
@@ -1173,7 +1261,7 @@ impl<T: UserEvent> Runtime<T> for MockRuntime {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn new_any_thread(_args: RuntimeInitArgs<()>) -> Result<Self> {
+  fn new_any_thread(_args: RuntimeInitArgs<MockRuntimeInitAttrs>) -> Result<Self> {
     Ok(Self::init())
   }
 
@@ -1208,17 +1296,21 @@ impl<T: UserEvent> Runtime<T> for MockRuntime {
       },
     );
 
-    let webview = webview_id.map(|id| DetachedWindowWebview {
-      webview: DetachedWebview {
-        label: pending.label.clone(),
-        dispatcher: MockWebviewDispatcher {
-          id,
-          context: self.context.clone(),
-          url: Arc::new(Mutex::new(pending.webview.unwrap().url)),
-          last_evaluated_script: Default::default(),
+    let webview = webview_id.map(|id| {
+      let w = pending.webview.as_ref().unwrap();
+      DetachedWindowWebview {
+        webview: DetachedWebview {
+          label: pending.label.clone(),
+          dispatcher: MockWebviewDispatcher {
+            id,
+            context: self.context.clone(),
+            url: Arc::new(Mutex::new(w.url.clone())),
+            last_evaluated_script: Default::default(),
+          },
         },
-      },
-      use_https_scheme: false,
+        use_https_scheme: false,
+        devtools: w.webview_attributes.devtools,
+      }
     });
 
     Ok(DetachedWindow {
@@ -1287,10 +1379,6 @@ impl<T: UserEvent> Runtime<T> for MockRuntime {
   fn hide(&self) {}
 
   fn set_device_event_filter(&mut self, filter: DeviceEventFilter) {}
-
-  fn custom_scheme_url(scheme: &str, _https: bool) -> String {
-    format!("{scheme}://localhost")
-  }
 
   #[cfg(any(
     target_os = "macos",

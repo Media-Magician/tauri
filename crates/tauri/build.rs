@@ -69,6 +69,8 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("cursor_position", true),
       ("theme", true),
       ("is_always_on_top", true),
+      ("activity_name", true),
+      ("scene_identifier", true),
       // setters
       ("center", false),
       ("request_user_attention", false),
@@ -166,6 +168,7 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("bundle_type", true),
       ("register_listener", true),
       ("remove_listener", true),
+      ("supports_multiple_windows", true),
     ],
   ),
   (
@@ -219,6 +222,7 @@ const PLUGINS: &[(&str, &[(&str, bool)])] = &[
       ("set_visible", true),
       ("set_temp_dir_path", true),
       ("set_icon_as_template", true),
+      ("set_icon_with_as_template", true),
       ("set_show_menu_on_left_click", true),
     ],
   ),
@@ -260,6 +264,21 @@ fn main() {
   let mobile = target_os == "ios" || target_os == "android";
   alias("desktop", !mobile);
   alias("mobile", mobile);
+
+  // the `gtk` crate alias (`gtk` 0.18 for GTK3, `gtk4` for GTK4) only exists when one of the
+  // GTK features is enabled, so every `gtk::` usage must be gated on this alias instead of
+  // just on the target OS.
+  let gtk_target = matches!(
+    target_os.as_str(),
+    "linux" | "dragonfly" | "freebsd" | "netbsd" | "openbsd"
+  );
+  let gtk3 = has_feature("gtk3");
+  let gtk4 = has_feature("gtk4");
+  let gtk = gtk_target && (gtk3 || gtk4);
+  alias("gtk", gtk);
+  // whether the menu APIs have a platform backend to talk to: muda falls back to a no-op
+  // implementation on Linux/BSD when no GTK version is selected.
+  alias("menu_backend", !mobile && (!gtk_target || gtk));
 
   let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -348,11 +367,6 @@ fn main() {
     .canonicalize()
     .expect("failed to canonicalize tauri global API script path");
   tauri_utils::plugin::define_global_api_script_path(&tauri_global_scripts);
-  // This should usually be done in `tauri-build`,
-  // but we need to do this here for the examples in this workspace to work as they don't have build scripts
-  if is_tauri_workspace {
-    tauri_utils::plugin::save_global_api_scripts_paths(&out_dir, Some(tauri_global_scripts));
-  }
 
   let permissions = define_permissions(&out_dir);
   tauri_utils::acl::build::generate_allowed_commands(&out_dir, None, permissions).unwrap();
