@@ -2740,6 +2740,17 @@ impl<T: UserEvent> CefRuntime<T> {
     ))]
     let pre_cef_signals = TerminationSignals::capture();
 
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "openbsd",
+      target_os = "netbsd"
+    ))]
+    if crate::external_message_pump::destroy_chromium_work_source() == 0 {
+      log::warn!("Chromium's GLib work source was not found; the event loop may not block");
+    }
+
     let args = cef::args::Args::new();
 
     #[cfg(target_os = "macos")]
