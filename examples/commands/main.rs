@@ -6,7 +6,7 @@
 
 // we move some basic commands to a separate module just to show it works
 mod commands;
-use commands::{cmd, invoke, message, resolver};
+use commands::{cmd, invoke, message, renamed_command_in_mod, resolver};
 
 use serde::Deserialize;
 use tauri::{
@@ -50,7 +50,7 @@ async fn async_stateful_command(
   the_argument: Option<String>,
   state: State<'_, MyState>,
 ) -> Result<(), ()> {
-  println!("{:?} {:?}", the_argument, state.inner());
+  println!("{:?} {:?}", the_argument, *state);
   Ok(())
 }
 // ------------------------ Raw future commands ------------------------
@@ -140,7 +140,7 @@ fn stateful_command_with_result(
   the_argument: Option<String>,
   state: State<'_, MyState>,
 ) -> Result<String, MyError> {
-  println!("{:?} {:?}", the_argument, state.inner());
+  println!("{:?} {:?}", the_argument, *state);
   dbg!(the_argument.ok_or(MyError::FooError))
 }
 
@@ -159,7 +159,7 @@ fn stateful_command_with_result_snake(
   the_argument: Option<String>,
   state: State<'_, MyState>,
 ) -> Result<String, MyError> {
-  println!("{:?} {:?}", the_argument, state.inner());
+  println!("{:?} {:?}", the_argument, *state);
   dbg!(the_argument.ok_or(MyError::FooError))
 }
 
@@ -176,7 +176,7 @@ async fn async_stateful_command_with_result(
   the_argument: Option<String>,
   state: State<'_, MyState>,
 ) -> Result<String, MyError> {
-  println!("{:?} {:?}", the_argument, state.inner());
+  println!("{:?} {:?}", the_argument, *state);
   Ok(the_argument.unwrap_or_default())
 }
 
@@ -185,6 +185,11 @@ async fn async_stateful_command_with_result(
 #[command]
 fn command_arguments_wild<R: Runtime>(_: Window<R>) {
   println!("we saw the wildcard!")
+}
+
+#[command(rename = "renamed_command_new")]
+fn renamed_command() {
+  println!("renamed command called")
 }
 
 #[derive(Deserialize)]
@@ -222,12 +227,12 @@ fn raw_request(request: Request<'_>) -> Response {
   Response::new(include_bytes!("./README.md").to_vec())
 }
 
-#[cfg_attr(feature = "cef", tauri::cef_entry_point)]
+#[cfg_attr(feature = "cef", tauri_runtime_cef::cef_entry_point)]
 fn main() {
   #[cfg(feature = "cef")]
-  let builder = tauri::Builder::<tauri::Cef>::default();
+  let builder = tauri::Builder::default().runtime(tauri_runtime_cef::Cef::default());
   #[cfg(not(feature = "cef"))]
-  let builder = tauri::Builder::<tauri::Wry>::new();
+  let builder = tauri::Builder::default().runtime(tauri_runtime_wry::Wry::default());
 
   builder
     .manage(MyState {
@@ -251,6 +256,8 @@ fn main() {
       future_simple_command,
       async_stateful_command,
       command_arguments_wild,
+      renamed_command,
+      renamed_command_in_mod,
       command_arguments_struct,
       simple_command_with_result,
       async_simple_command_snake,

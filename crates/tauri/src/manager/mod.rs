@@ -6,13 +6,13 @@ use std::{
   borrow::Cow,
   collections::HashMap,
   fmt,
-  sync::{Arc, Mutex, MutexGuard, atomic::AtomicBool},
+  sync::{Arc, Mutex, MutexGuard, OnceLock, atomic::AtomicBool},
 };
 
 use serde::Serialize;
 use url::Url;
 
-use tauri_macros::default_runtime;
+use tauri_runtime::RuntimeHandle as _;
 use tauri_utils::{
   assets::{AssetKey, CspHash, SCRIPT_NONCE_TOKEN, STYLE_NONCE_TOKEN},
   config::{Csp, CspDirectiveSources},
@@ -30,6 +30,8 @@ use crate::{
   resources::ResourceTable,
   utils::{PackageInfo, config::Config},
 };
+
+use crate::app::OnWebContentProcessTerminate;
 
 #[cfg(desktop)]
 mod menu;
@@ -177,9 +179,10 @@ impl Asset {
   }
 }
 
-#[default_runtime(crate::Wry, wry)]
-pub struct AppManager<R: Runtime> {
+pub struct AppManager<R: Runtime = crate::DynRuntime> {
   pub runtime_authority: Mutex<RuntimeAuthority>,
+  /// Handle of the runtime, set once the runtime is initialized.
+  runtime_handle: OnceLock<R::Handle>,
   pub window: window::WindowManager<R>,
   pub webview: webview::WebviewManager<R>,
   #[cfg(all(desktop, feature = "tray-icon"))]
@@ -193,6 +196,11 @@ pub struct AppManager<R: Runtime> {
   pub config: Config,
   #[cfg(dev)]
   pub config_parent: Option<std::path::PathBuf>,
+  /// Directory where remapped resources have been mirrored for this run,
+  /// so joined resource paths keep working in development.
+  /// See [`crate::path::PathResolver::resource_dir`].
+  #[cfg(all(dev, desktop))]
+  pub(crate) dev_resources_dir: Mutex<Option<std::path::PathBuf>>,
   pub assets: Box<dyn Assets<R>>,
 
   pub app_icon: Option<Vec<u8>>,
@@ -251,6 +259,8 @@ impl<R: Runtime> AppManager<R> {
     plugins: PluginStore<R>,
     invoke_handler: Box<InvokeHandler<R>>,
     on_page_load: Option<Arc<OnPageLoad<R>>>,
+    on_permission_request: Option<Arc<crate::webview::PermissionRequestHandler<R>>>,
+    on_web_content_process_terminate: Option<Arc<OnWebContentProcessTerminate<R>>>,
     uri_scheme_protocols: HashMap<String, Arc<webview::UriSchemeProtocol<R>>>,
     state: StateManager,
     #[cfg(desktop)] menu_event_listener: Vec<crate::app::GlobalMenuEventListener<AppHandle<R>>>,
@@ -275,6 +285,7 @@ impl<R: Runtime> AppManager<R> {
 
     Self {
       runtime_authority: Mutex::new(context.runtime_authority),
+      runtime_handle: OnceLock::new(),
       window: window::WindowManager {
         windows: Mutex::default(),
         default_icon: context.default_window_icon,
@@ -284,6 +295,8 @@ impl<R: Runtime> AppManager<R> {
         webviews: Mutex::default(),
         invoke_handler,
         on_page_load,
+        on_permission_request,
+        on_web_content_process_terminate,
         uri_scheme_protocols: Mutex::new(uri_scheme_protocols),
         event_listeners: Arc::new(webview_event_listeners),
         invoke_initialization_script,
@@ -308,6 +321,8 @@ impl<R: Runtime> AppManager<R> {
       config: context.config,
       #[cfg(dev)]
       config_parent: context.config_parent,
+      #[cfg(all(dev, desktop))]
+      dev_resources_dir: Mutex::default(),
       assets: context.assets,
       app_icon: context.app_icon,
       package_info: context.package_info,
@@ -327,7 +342,7 @@ impl<R: Runtime> AppManager<R> {
 
   /// Get the base app URL for [`WebviewUrl::App`](tauri_utils::config::WebviewUrl::App).
   ///
-  /// * In dev mode, this is the [`devUrl`](tauri_utils::config::BuildConfig::dev_url) configuration value if it exsits.
+  /// * In dev mode, this is the [`devUrl`](tauri_utils::config::BuildConfig::dev_url) configuration value if it exists.
   /// * In production mode, this is the [`frontendDist`](tauri_utils::config::BuildConfig::frontend_dist) configuration value if it's a [`FrontendDist::Url`](tauri_utils::config::FrontendDist::Url).
   /// * Returns [`Self::tauri_protocol_url`] (e.g. `tauri://localhost`) otherwise.
   pub(crate) fn get_app_url(&self, https: bool) -> Cow<'_, Url> {
@@ -342,8 +357,26 @@ impl<R: Runtime> AppManager<R> {
     if let Some(url) = url {
       Cow::Borrowed(url)
     } else {
-      Cow::Owned(R::custom_scheme_url("tauri", https).parse().unwrap())
+      Cow::Owned(self.custom_scheme_url("tauri", https).parse().unwrap())
     }
+  }
+
+  /// Stores the runtime handle. Called once the runtime is initialized.
+  pub(crate) fn set_runtime_handle(&self, handle: R::Handle) {
+    let _ = self.runtime_handle.set(handle);
+  }
+
+  /// Returns the URL for a custom scheme, as defined by the runtime (e.g. `tauri://localhost` or `http://tauri.localhost`).
+  ///
+  /// # Panics
+  ///
+  /// Panics if the runtime was not initialized yet.
+  pub(crate) fn custom_scheme_url(&self, scheme: &str, https: bool) -> String {
+    self
+      .runtime_handle
+      .get()
+      .expect("runtime not initialized")
+      .custom_scheme_url(scheme, https)
   }
 
   fn csp(&self) -> Option<Csp> {
@@ -360,6 +393,7 @@ impl<R: Runtime> AppManager<R> {
     }
   }
 
+  // TODO: Change to return `crate::Result` here in v3
   pub fn get_asset(
     &self,
     mut path: String,
@@ -405,46 +439,39 @@ impl<R: Runtime> AppManager<R> {
         asset_path = fallback;
         asset
       })
-      .ok_or_else(|| crate::Error::AssetNotFound(path.clone()))
-      .map(Cow::into_owned);
+      .ok_or_else(|| {
+        let error = crate::Error::AssetNotFound(path.clone());
+        log::error!("{error}");
+        Box::new(error)
+      })?;
 
     let mut csp_header = None;
     let is_html = asset_path.as_ref().ends_with(".html");
 
-    match asset_response {
-      Ok(asset) => {
-        let final_data = if is_html {
-          let mut asset = String::from_utf8_lossy(&asset).into_owned();
-          if let Some(csp) = self.csp() {
-            #[allow(unused_mut)]
-            let mut csp_map = set_csp(&mut asset, &self.assets, &asset_path, self, csp);
-            #[cfg(feature = "isolation")]
-            if let Pattern::Isolation { schema, .. } = &*self.pattern {
-              let default_src = csp_map
-                .entry("default-src".into())
-                .or_insert_with(Default::default);
-              default_src.push(R::custom_scheme_url(schema, _use_https_schema));
-            }
+    let final_data = if is_html {
+      let mut asset = String::from_utf8_lossy(&asset_response).into_owned();
+      if let Some(csp) = self.csp() {
+        #[allow(unused_mut)]
+        let mut csp_map = set_csp(&mut asset, &self.assets, &asset_path, self, csp);
+        #[cfg(feature = "isolation")]
+        if let Pattern::Isolation { schema, .. } = &*self.pattern {
+          let default_src = csp_map.entry("default-src".to_owned()).or_default();
+          default_src.push(self.custom_scheme_url(schema, _use_https_schema));
+        }
 
-            csp_header.replace(Csp::DirectiveMap(csp_map).to_string());
-          }
+        csp_header.replace(Csp::DirectiveMap(csp_map).to_string());
+      }
 
-          asset.into_bytes()
-        } else {
-          asset
-        };
-        let mime_type = tauri_utils::mime_type::MimeType::parse(&final_data, &path);
-        Ok(Asset {
-          bytes: final_data,
-          mime_type,
-          csp_header,
-        })
-      }
-      Err(e) => {
-        log::error!("{:?}", e);
-        Err(Box::new(e))
-      }
-    }
+      asset.into_bytes()
+    } else {
+      asset_response.into_owned()
+    };
+    let mime_type = tauri_utils::mime_type::MimeType::parse(&final_data, &path);
+    Ok(Asset {
+      bytes: final_data,
+      mime_type,
+      csp_header,
+    })
   }
 
   pub(crate) fn listeners(&self) -> &Listeners {
@@ -455,12 +482,15 @@ impl<R: Runtime> AppManager<R> {
     (self.webview.invoke_handler)(invoke)
   }
 
-  pub fn extend_api(&self, plugin: &str, invoke: Invoke<R>) -> bool {
+  /// Runs the plugin [`crate::plugin::Plugin::extend_api`] hook if it exists. Returns whether the invoke message was handled or not.
+  ///
+  /// The message is not handled when the plugin exists **and** the command does not.
+  pub fn run_plugin_invoke_handler(&self, plugin: &str, invoke: Invoke<R>) -> bool {
     self
       .plugins
       .lock()
       .expect("poisoned plugin store")
-      .extend_api(plugin, invoke)
+      .run_invoke_handler(plugin, invoke)
   }
 
   pub fn initialize_plugins(&self, app: &AppHandle<R>) -> crate::Result<()> {
@@ -628,9 +658,9 @@ impl<R: Runtime> AppManager<R> {
     self
       .window
       .windows_lock()
-      .iter()
-      .find(|w| w.1.is_focused().unwrap_or(false))
-      .map(|w| w.1.clone())
+      .values()
+      .find(|w| w.is_focused().unwrap_or(false))
+      .cloned()
   }
 
   pub(crate) fn on_window_close(&self, label: &str) {
@@ -638,13 +668,16 @@ impl<R: Runtime> AppManager<R> {
     if let Some(window) = window {
       for webview in window.webviews() {
         self.webview.webviews_lock().remove(webview.label());
+        self.listeners().remove_webview_listeners(webview.label());
       }
     }
+    self.listeners().remove_window_listeners(label);
   }
 
   #[cfg(desktop)]
   pub(crate) fn on_webview_close(&self, label: &str) {
     self.webview.webviews_lock().remove(label);
+    self.listeners().remove_webview_listeners(label);
   }
 
   pub fn windows(&self) -> HashMap<String, Window<R>> {
@@ -718,7 +751,7 @@ mod test {
 
   use crate::{
     App, Emitter, Listener, Manager, StateManager, Webview, WebviewWindow, WebviewWindowBuilder,
-    Window, Wry,
+    Window,
     event::EventTarget,
     generate_context,
     plugin::PluginStore,
@@ -740,85 +773,39 @@ mod test {
   const TEST_EVENT_NAME: &str = "event";
 
   #[test]
-  fn check_get_url_wry() {
+  fn check_get_url() {
     let context = generate_context!("test/fixture/src-tauri/tauri.conf.json", crate, test = true);
-    let manager: AppManager<Wry> = AppManager::with_handlers(
+    let manager: AppManager<MockRuntime> = AppManager::with_handlers(
       context,
       PluginStore::default(),
       Box::new(|_| false),
-      None,
-      Default::default(),
-      StateManager::new(),
-      Default::default(),
+      None,                // on_page_load
+      None,                // on_permission_request
+      None,                // on_web_content_process_terminate
+      Default::default(),  // uri_scheme_protocols
+      StateManager::new(), // state
+      Default::default(),  // menu_event_listener
       #[cfg(all(desktop, feature = "tray-icon"))]
-      Default::default(),
-      Default::default(),
-      Default::default(),
-      Default::default(),
-      "".into(),
-      None,
-      crate::generate_invoke_key().unwrap(),
+      Default::default(), // tray_icon_event_listeners
+      Default::default(),  // window_event_listeners
+      Default::default(),  // webview_event_listeners
+      Default::default(),  // window_menu_event_listeners
+      "".into(),           // invoke_initialization_script
+      None,                // channel_interceptor
+      crate::generate_invoke_key().unwrap(), // invoke_key,
     );
+    // the custom scheme URL format comes from the runtime handle
+    let runtime =
+      <MockRuntime as tauri_runtime::Runtime<crate::EventLoopMessage>>::new(Default::default())
+        .expect("failed to create mock runtime");
+    manager.set_runtime_handle(<MockRuntime as tauri_runtime::Runtime<
+      crate::EventLoopMessage,
+    >>::handle(&runtime));
 
     #[cfg(custom_protocol)]
     {
-      assert_eq!(
-        manager.get_app_url(false).to_string(),
-        if cfg!(windows) || cfg!(target_os = "android") {
-          "http://tauri.localhost/"
-        } else {
-          "tauri://localhost"
-        }
-      );
-      assert_eq!(
-        manager.get_app_url(true).to_string(),
-        if cfg!(windows) || cfg!(target_os = "android") {
-          "https://tauri.localhost/"
-        } else {
-          "tauri://localhost"
-        }
-      );
-    }
-
-    #[cfg(dev)]
-    assert_eq!(
-      manager.get_app_url(false).to_string(),
-      "http://localhost:4000/"
-    );
-  }
-
-  #[cfg(feature = "cef")]
-  #[test]
-  fn check_get_url_cef() {
-    let context = generate_context!("test/fixture/src-tauri/tauri.conf.json", crate, test = true);
-    let manager: AppManager<crate::Cef> = AppManager::with_handlers(
-      context,
-      PluginStore::default(),
-      Box::new(|_| false),
-      None,
-      Default::default(),
-      StateManager::new(),
-      Default::default(),
-      #[cfg(all(desktop, feature = "tray-icon"))]
-      Default::default(),
-      Default::default(),
-      Default::default(),
-      Default::default(),
-      "".into(),
-      None,
-      crate::generate_invoke_key().unwrap(),
-    );
-
-    #[cfg(custom_protocol)]
-    {
-      assert_eq!(
-        manager.get_app_url(false).to_string(),
-        "http://tauri.localhost/"
-      );
-      assert_eq!(
-        manager.get_app_url(true).to_string(),
-        "https://tauri.localhost/"
-      );
+      assert_eq!(manager.get_app_url(false).to_string(), "tauri://localhost");
+      assert_eq!(manager.get_app_url(true).to_string(), "tauri://localhost");
     }
 
     #[cfg(dev)]

@@ -10,11 +10,11 @@ use crate::{
       sign::{should_sign, sign_command, try_sign},
       util::{
         NSIS_OUTPUT_FOLDER_NAME, NSIS_UPDATER_OUTPUT_FOLDER_NAME, download_webview2_bootstrapper,
-        download_webview2_offline_installer,
+        download_webview2_offline_installer, vc_runtime_dlls,
       },
     },
   },
-  error::ErrorExt,
+  error::{ErrorExt, bail},
   utils::{
     CommandExt,
     http_utils::{HashAlgorithm, download_and_verify, verify_file_hash},
@@ -281,6 +281,13 @@ fn build_nsis_app_installer(
     to_json(&additional_plugins_path),
   );
 
+  if let Some(plugin_copy_path) = &maybe_plugin_copy_path {
+    data.insert(
+      "signed_plugins_path",
+      to_json(plugin_copy_path.join("x86-unicode")),
+    );
+  }
+
   data.insert("arch", to_json(arch));
   data.insert("bundle_id", to_json(bundle_id));
   data.insert("manufacturer", to_json(manufacturer));
@@ -318,7 +325,8 @@ fn build_nsis_app_installer(
   );
 
   if let Some(license_file) = settings.license_file() {
-    let license_file = dunce::canonicalize(license_file)?;
+    let license_file = dunce::canonicalize(&license_file)
+      .fs_context("failed to resolve `bundle > licenseFile`", license_file)?;
     let license_file_with_bom = output_path.join("license_file");
     let content = std::fs::read(license_file)?;
     write_utf8_with_bom(&license_file_with_bom, content)?;
@@ -338,30 +346,72 @@ fn build_nsis_app_installer(
     if let Some(installer_icon) = &nsis.installer_icon {
       data.insert(
         "installer_icon",
-        to_json(dunce::canonicalize(installer_icon)?),
+        to_json(dunce::canonicalize(installer_icon).fs_context(
+          "failed to resolve `bundle > windows > nsis > installerIcon`",
+          installer_icon.to_owned(),
+        )?),
       );
     }
 
     if let Some(header_image) = &nsis.header_image {
-      data.insert("header_image", to_json(dunce::canonicalize(header_image)?));
+      data.insert(
+        "header_image",
+        to_json(dunce::canonicalize(header_image).fs_context(
+          "failed to resolve `bundle > windows > nsis > headerImage`",
+          header_image.to_owned(),
+        )?),
+      );
     }
 
     if let Some(sidebar_image) = &nsis.sidebar_image {
       data.insert(
         "sidebar_image",
-        to_json(dunce::canonicalize(sidebar_image)?),
+        to_json(dunce::canonicalize(sidebar_image).fs_context(
+          "failed to resolve `bundle > windows > nsis > sidebarImage`",
+          sidebar_image.to_owned(),
+        )?),
+      );
+    }
+
+    if let Some(uninstaller_icon) = &nsis.uninstaller_icon {
+      data.insert(
+        "uninstaller_icon",
+        to_json(dunce::canonicalize(uninstaller_icon).fs_context(
+          "failed to resolve `bundle > windows > nsis > uninstallerIcon`",
+          uninstaller_icon.to_owned(),
+        )?),
+      );
+    }
+
+    if let Some(uninstaller_header_image) = &nsis.uninstaller_header_image {
+      data.insert(
+        "uninstaller_header_image",
+        to_json(dunce::canonicalize(uninstaller_header_image).fs_context(
+          "failed to resolve `bundle > windows > nsis > uninstallerHeaderImage`",
+          uninstaller_header_image.to_owned(),
+        )?),
       );
     }
 
     if let Some(installer_hooks) = &nsis.installer_hooks {
-      let installer_hooks = dunce::canonicalize(installer_hooks)?;
+      let installer_hooks = dunce::canonicalize(installer_hooks).fs_context(
+        "failed to resolve `bundle > windows > nsis > installerHooks`",
+        installer_hooks.to_owned(),
+      )?;
       data.insert("installer_hooks", to_json(installer_hooks));
     }
 
     if let Some(start_menu_folder) = &nsis.start_menu_folder {
       data.insert("start_menu_folder", to_json(start_menu_folder));
     }
-    if let Some(minimum_webview2_version) = &nsis.minimum_webview2_version {
+    // only enforced for runtimes that use WebView2, see `Settings::minimum_webview2_version`
+    #[allow(deprecated)]
+    if let Some(minimum_webview2_version) = nsis
+      .minimum_webview2_version
+      .as_deref()
+      .filter(|_| settings.webview_runtime().uses_webview2())
+      .or(settings.minimum_webview2_version())
+    {
       data.insert(
         "minimum_webview2_version",
         to_json(minimum_webview2_version),
@@ -508,22 +558,23 @@ fn build_nsis_app_installer(
     }
   }
 
-  let silent_webview2_install = if let WebviewInstallMode::DownloadBootstrapper { silent }
-  | WebviewInstallMode::EmbedBootstrapper { silent }
-  | WebviewInstallMode::OfflineInstaller { silent } =
-    settings.windows().webview_install_mode
-  {
-    silent
-  } else {
-    true
+  // WebView2 is only installed for runtimes that use it, see `Settings::webview_install_mode`
+  let webview2_install_mode = match settings.webview_install_mode() {
+    // the updater installer downloads the bootstrapper instead of shipping it, to keep the package small
+    WebviewInstallMode::EmbedBootstrapper { silent }
+    | WebviewInstallMode::OfflineInstaller { silent }
+      if updater =>
+    {
+      WebviewInstallMode::DownloadBootstrapper { silent }
+    }
+    mode => mode,
   };
 
-  let webview2_install_mode = if updater {
-    WebviewInstallMode::DownloadBootstrapper {
-      silent: silent_webview2_install,
-    }
-  } else {
-    settings.windows().webview_install_mode.clone()
+  let silent_webview2_install = match webview2_install_mode {
+    WebviewInstallMode::DownloadBootstrapper { silent }
+    | WebviewInstallMode::EmbedBootstrapper { silent }
+    | WebviewInstallMode::OfflineInstaller { silent } => silent,
+    _ => true,
   };
 
   let webview2_installer_args = to_json(if silent_webview2_install {
@@ -610,7 +661,7 @@ fn build_nsis_app_installer(
   );
 
   let nsis_output_path = output_path.join(out_file);
-  let nsis_installer_path = settings.project_out_directory().to_path_buf().join(format!(
+  let nsis_installer_path = settings.project_out_directory().join(format!(
     "bundle/{}/{}.exe",
     if updater {
       NSIS_UPDATER_OUTPUT_FOLDER_NAME
@@ -643,11 +694,7 @@ fn build_nsis_app_installer(
   #[cfg(not(target_os = "windows"))]
   let mut nsis_cmd = Command::new("makensis");
 
-  if let Some(plugins_path) = &maybe_plugin_copy_path {
-    nsis_cmd.env("NSISPLUGINS", plugins_path);
-  }
-
-  nsis_cmd
+  let status = nsis_cmd
     .args(["-INPUTCHARSET", "UTF8", "-OUTPUTCHARSET", "UTF8"])
     .arg(match settings.log_level() {
       log::Level::Error => "-V1",
@@ -664,6 +711,9 @@ fn build_nsis_app_installer(
       command: "makensis.exe".to_string(),
       error,
     })?;
+  if !status.success() {
+    bail!("Failed to bundle app with makensis");
+  }
 
   fs::rename(nsis_output_path, &nsis_installer_path)?;
 
@@ -743,7 +793,7 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
   let mut added_resources = Vec::new();
 
   // Adding WebViewer2Loader.dll in case windows-gnu toolchain is used
-  if settings.target().ends_with("-gnu") {
+  if settings.webview_runtime().uses_webview2() && settings.target().ends_with("-gnu") {
     let loader_path =
       dunce::simplified(&settings.project_out_directory().join("WebView2Loader.dll")).to_path_buf();
     if loader_path.exists() {
@@ -758,9 +808,26 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
     }
   }
 
-  // Handle CEF support if cef_path is set,
+  if settings.windows().bundle_vc_runtime {
+    for dll in vc_runtime_dlls(settings.binary_arch())? {
+      let dll = dunce::simplified(&dll).to_path_buf();
+      if added_resources.contains(&dll) {
+        continue;
+      }
+      let target = PathBuf::from(
+        dll
+          .file_name()
+          .expect("failed to extract Visual C++ runtime DLL filename"),
+      );
+      added_resources.push(dll.clone());
+      resources.insert(dll, (PathBuf::new(), target));
+    }
+  }
+
+  // Handle CEF support when the app embeds a CEF distribution,
   // using https://github.com/chromiumembedded/cef/blob/master/tools/distrib/win/README.redistrib.txt as a reference
-  if settings.bundle_settings().cef_path.is_some() {
+  if let Some(cef_path) = settings.webview_runtime().cef_distribution() {
+    let project_out = settings.project_out_directory();
     let cef_files = [
       // required
       "libcef.dll",
@@ -778,7 +845,7 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
       // TODO: check if x64 means no arm64
       "dxil.dll",
       "dxcompiler.dll",
-      // ANGEL support
+      // ANGLE support
       "libEGL.dll",
       "libGLESv2.dll",
       // SwANGLE support
@@ -791,7 +858,9 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
     ];
 
     for f in &cef_files {
-      let src_path = dunce::simplified(&settings.project_out_directory().join(f)).to_path_buf();
+      let from = cef_path.join(f);
+      let src_path = dunce::simplified(&project_out.join(f)).to_path_buf();
+      fs::copy(&from, &src_path).fs_context("failed to copy CEF file for NSIS bundle", from)?;
       if settings.windows().can_sign() && should_sign(&src_path)? {
         try_sign(&src_path, settings)?;
       }
@@ -808,10 +877,17 @@ fn generate_resource_data(settings: &Settings) -> crate::Result<ResourcesMap> {
       "en-US_NEUTER.pak",
     ];
 
+    let locales_out = dunce::simplified(&project_out.join("locales")).to_path_buf();
+    fs::create_dir_all(&locales_out).fs_context(
+      "failed to create locales directory for CEF",
+      locales_out.clone(),
+    )?;
+
     for f in &locales {
       let target_file = PathBuf::from("locales").join(f);
-      let src_path =
-        dunce::simplified(&settings.project_out_directory().join(&target_file)).to_path_buf();
+      let from = cef_path.join("locales").join(f);
+      let src_path = dunce::simplified(&locales_out.join(f)).to_path_buf();
+      fs::copy(&from, &src_path).fs_context("failed to copy CEF locale for NSIS bundle", from)?;
       added_resources.push(src_path.clone());
       resources.insert(src_path, (PathBuf::from("locales"), target_file));
     }
@@ -930,6 +1006,7 @@ fn get_lang_data(lang: &str) -> Option<(String, &[u8])> {
     "portuguese" => include_bytes!("./languages/Portuguese.nsh"),
     "ukrainian" => include_bytes!("./languages/Ukrainian.nsh"),
     "norwegian" => include_bytes!("./languages/Norwegian.nsh"),
+    "vietnamese" => include_bytes!("./languages/Vietnamese.nsh"),
     _ => return None,
   };
   Some((path, content))

@@ -88,6 +88,18 @@ pub enum Error {
   /// The Window's raw handle is invalid for the platform.
   #[error("Unexpected `raw_window_handle` for the current platform")]
   InvalidWindowHandle,
+  /// The active runtime uses a different GTK version than the one this crate was built against.
+  #[cfg(gtk)]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "gtk3", feature = "gtk4"))))]
+  #[error(
+    "the `tauri` crate was built for {expected} but the active runtime uses {active}: enable the matching `gtk3`/`gtk4` feature and link a single runtime crate on Linux"
+  )]
+  GtkVersionMismatch {
+    /// The GTK version the `gtk3`/`gtk4` features selected.
+    expected: tauri_runtime::gtk::Version,
+    /// The GTK version the active runtime declared.
+    active: tauri_runtime::gtk::Version,
+  },
   /// JNI error.
   #[cfg(target_os = "android")]
   #[error("jni error: {0}")]
@@ -166,6 +178,9 @@ pub enum Error {
   /// tokio oneshot channel failed to receive message
   #[error(transparent)]
   TokioOneshotRecv(#[from] tokio::sync::oneshot::error::RecvError),
+  /// Unexpected menu kind passed to menu/tray plugin command
+  #[error("Unexpected menu kind")]
+  UnexpectedMenuKind,
 }
 
 impl From<getrandom::Error> for Error {

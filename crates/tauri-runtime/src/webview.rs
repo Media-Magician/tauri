@@ -4,6 +4,7 @@
 
 //! A layer between raw [`Runtime`] webviews and Tauri.
 //!
+pub use crate::webview_permissions::{PermissionKind, PermissionResponse};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::window::WindowId;
 use crate::{Rect, Runtime, UserEvent, window::is_label_valid};
@@ -40,9 +41,57 @@ pub type OnPageLoadHandler = dyn Fn(Url, PageLoadEvent) + Send;
 
 pub type DocumentTitleChangedHandler = dyn Fn(String) + Send + 'static;
 
-pub type AddressChangedHandler = dyn Fn(&Url) + Send + Sync + 'static;
-
 pub type DownloadHandler = dyn Fn(DownloadEvent) -> bool + Send + Sync;
+
+type PermissionRequestHandler = dyn Fn(PermissionKind) -> PermissionResponse + Send + Sync;
+
+/// Runtime-reported reason that a web content process stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebContentProcessTerminationReason {
+  /// The runtime does not expose a reason (for example, WebKit).
+  Unknown,
+  /// The process exited normally.
+  Normal,
+  /// The process exited abnormally without a more specific cause.
+  Abnormal,
+  /// The process was killed; this may be an intentional action.
+  Killed,
+  /// The process crashed.
+  Crashed,
+  /// The process ran out of memory.
+  OutOfMemory,
+  /// The runtime could not launch the process.
+  LaunchFailed,
+  /// The process failed an integrity check.
+  IntegrityFailure,
+}
+
+/// Details provided by the runtime when a web content process terminates.
+///
+/// Error text is untrusted and may contain sensitive page data. Applications
+/// should sanitize it before logging or displaying it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebContentProcessTermination {
+  /// The runtime's termination classification; unknown is never a normal exit.
+  pub reason: WebContentProcessTerminationReason,
+  /// Native runtime error code, when available.
+  pub error_code: Option<i32>,
+  /// Native runtime error text, when available.
+  pub error_string: Option<String>,
+}
+
+impl Default for WebContentProcessTermination {
+  fn default() -> Self {
+    Self {
+      reason: WebContentProcessTerminationReason::Unknown,
+      error_code: None,
+      error_string: None,
+    }
+  }
+}
+
+pub type OnWebContentProcessTerminateHandler = dyn Fn(WebContentProcessTermination) + Send;
 
 #[cfg(target_os = "ios")]
 type InputAccessoryViewBuilderFn = dyn Fn(&objc2_ui_kit::UIView) -> Option<objc2::rc::Retained<objc2_ui_kit::UIView>>
@@ -78,6 +127,24 @@ pub struct CreationContext<'a, 'b> {
   pub activity: &'a jni::objects::JObject<'b>,
   pub webview: &'a jni::objects::JObject<'b>,
 }
+
+/// Raw handles of an iOS webview, exposed through [`crate::WebviewDispatch::with_ios_webview`].
+///
+/// The pointers are borrowed from handles owned by the runtime and are only valid while the webview is alive.
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Copy)]
+pub struct IosWebviewHandle {
+  /// The [WKWebView](https://developer.apple.com/documentation/webkit/wkwebview) pointer.
+  pub webview: *mut std::ffi::c_void,
+  /// The [WKUserContentController](https://developer.apple.com/documentation/webkit/wkusercontentcontroller) pointer.
+  pub manager: *mut std::ffi::c_void,
+  /// The [UIViewController](https://developer.apple.com/documentation/uikit/uiviewcontroller) hosting the webview.
+  pub view_controller: *mut std::ffi::c_void,
+}
+
+// SAFETY: the pointers are only dereferenced on the main thread by the consumer.
+#[cfg(target_os = "ios")]
+unsafe impl Send for IosWebviewHandle {}
 
 /// Kind of event for the page load handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +228,7 @@ pub enum ScrollBarStyle {
   /// Fluent UI style overlay scrollbars. **Windows Only**
   ///
   /// Requires WebView2 Runtime version 125.0.2535.41 or higher, does nothing on older versions,
-  /// see https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/?tabs=dotnetcsharp#10253541
+  /// see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/?tabs=dotnetcsharp#10253541>
   FluentOverlay,
 }
 
@@ -176,8 +243,8 @@ pub struct PendingWebview<T: UserEvent, R: Runtime<T>> {
   /// Information about the webview that initiated a new window request.
   pub opener: Option<R::WindowOpener>,
 
-  /// Runtime specific attributes.
-  pub platform_specific_attributes: Vec<R::PlatformSpecificWebviewAttribute>,
+  /// The runtime-specific webview attributes, see [`Runtime::RuntimeWebviewAttributes`](crate::Runtime::RuntimeWebviewAttributes).
+  pub runtime_specific_attributes: R::RuntimeWebviewAttributes,
 
   /// Custom protocols to register on the webview
   pub uri_scheme_protocols: HashMap<String, Box<UriSchemeProtocolHandler>>,
@@ -192,28 +259,30 @@ pub struct PendingWebview<T: UserEvent, R: Runtime<T>> {
 
   pub document_title_changed_handler: Option<Box<DocumentTitleChangedHandler>>,
 
-  pub address_changed_handler: Option<Box<AddressChangedHandler>>,
-
   /// The resolved URL to load on the webview.
   pub url: String,
 
   #[cfg(target_os = "android")]
   #[allow(clippy::type_complexity)]
   pub on_webview_created:
-    Option<Box<dyn Fn(CreationContext<'_, '_>) -> Result<(), jni::errors::Error> + Send>>,
+    Option<Box<dyn Fn(CreationContext<'_, '_>) -> Result<(), jni::errors::Error> + Send + Sync>>,
 
   pub web_resource_request_handler: Option<Box<WebResourceRequestHandler>>,
 
   pub on_page_load_handler: Option<Box<OnPageLoadHandler>>,
 
   pub download_handler: Option<Arc<DownloadHandler>>,
+
+  pub permission_request_handler: Option<Box<PermissionRequestHandler>>,
+
+  pub on_web_content_process_terminate_handler: Option<Box<OnWebContentProcessTerminateHandler>>,
 }
 
 impl<T: UserEvent, R: Runtime<T>> PendingWebview<T, R> {
   /// Create a new [`PendingWebview`] with a label from the given [`WebviewAttributes`].
   pub fn new(
     webview_attributes: WebviewAttributes,
-    platform_specific_attributes: Vec<R::PlatformSpecificWebviewAttribute>,
+    runtime_specific_attributes: R::RuntimeWebviewAttributes,
     label: impl Into<String>,
   ) -> crate::Result<Self> {
     let label = label.into();
@@ -223,20 +292,21 @@ impl<T: UserEvent, R: Runtime<T>> PendingWebview<T, R> {
       Ok(Self {
         webview_attributes,
         opener: None,
-        platform_specific_attributes,
+        runtime_specific_attributes,
         uri_scheme_protocols: Default::default(),
         label,
         ipc_handler: None,
         navigation_handler: None,
         new_window_handler: None,
         document_title_changed_handler: None,
-        address_changed_handler: None,
         url: "tauri://localhost".to_string(),
         #[cfg(target_os = "android")]
         on_webview_created: None,
         web_resource_request_handler: None,
         on_page_load_handler: None,
         download_handler: None,
+        permission_request_handler: None,
+        on_web_content_process_terminate_handler: None,
       })
     }
   }
@@ -260,7 +330,7 @@ impl<T: UserEvent, R: Runtime<T>> PendingWebview<T, R> {
 
   #[cfg(target_os = "android")]
   pub fn on_webview_created<
-    F: Fn(CreationContext<'_, '_>) -> Result<(), jni::errors::Error> + Send + 'static,
+    F: Fn(CreationContext<'_, '_>) -> Result<(), jni::errors::Error> + Send + Sync + 'static,
   >(
     mut self,
     f: F,
@@ -349,6 +419,24 @@ pub struct WebviewAttributes {
   /// see https://docs.rs/objc2-web-kit/latest/objc2_web_kit/struct.WKWebView.html#method.allowsLinkPreview
   pub allow_link_preview: bool,
   pub scroll_bar_style: ScrollBarStyle,
+  /// Controls the WebView's browser-level general autofill behavior.
+  ///
+  /// **This option does not disable password or credit card autofill.**
+  ///
+  /// When set to `false`, the WebView will not automatically populate
+  /// general form fields using previously stored data such as addresses
+  /// or contact information.
+  ///
+  /// If not specified, this is `true` by default.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows**: Supported. WebView2's autofill feature (called
+  ///   "Suggestions") may not honor `autocomplete="off"` on input
+  ///   elements in some cases.
+  /// - **Linux / Android / iOS / macOS**: Unsupported and performs no
+  ///   operation.
+  pub general_autofill_enabled: bool,
   /// Allows overriding the keyboard accessory view on iOS.
   /// Returning `None` effectively removes the view.
   ///
@@ -362,6 +450,8 @@ pub struct WebviewAttributes {
   /// This relies on [`objc2_ui_kit`] which does not provide a stable API yet, so it can receive breaking changes in minor releases.
   #[cfg(target_os = "ios")]
   pub input_accessory_view_builder: Option<InputAccessoryViewBuilder>,
+  #[cfg(target_os = "ios")]
+  pub limit_navigations_to_app_bound_domains: bool,
 }
 
 unsafe impl Send for WebviewAttributes {}
@@ -400,7 +490,9 @@ impl From<&WindowConfig> for WebviewAttributes {
         #[cfg(windows)]
         ConfigScrollBarStyle::FluentOverlay => ScrollBarStyle::FluentOverlay,
         _ => ScrollBarStyle::Default,
-      });
+      })
+      .limit_navigations_to_app_bound_domains(config.limit_navigations_to_app_bound_domains)
+      .general_autofill_enabled(config.general_autofill_enabled);
 
     #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
     {
@@ -475,8 +567,11 @@ impl WebviewAttributes {
       javascript_disabled: false,
       allow_link_preview: true,
       scroll_bar_style: ScrollBarStyle::Default,
+      general_autofill_enabled: true,
       #[cfg(target_os = "ios")]
       input_accessory_view_builder: None,
+      #[cfg(target_os = "ios")]
+      limit_navigations_to_app_bound_domains: false,
     }
   }
 
@@ -546,7 +641,9 @@ impl WebviewAttributes {
     self
   }
 
-  /// Disables the drag and drop handler. This is required to use HTML5 drag and drop APIs on the frontend on Windows.
+  /// Disables the drag and drop handler used internally to generate [`DragDropEvent`](crate::window::DragDropEvent)s.
+  ///
+  /// This is required to use HTML5 drag and drop APIs on the frontend on Windows since we replace the drag drop handler of WebView2.
   #[must_use]
   pub fn disable_drag_drop_handler(mut self) -> Self {
     self.drag_drop_handler_enabled = false;
@@ -716,6 +813,65 @@ impl WebviewAttributes {
     self
   }
 
+  /// Whether to limit navigations to App-Bound Domains. This is necessary to
+  /// enable Service Workers on iOS according to
+  /// [StackOverflow](https://stackoverflow.com/questions/49673399/service-workers-unavailable-in-wkwebview-in-ios-11-3/64155509#64155509).
+  ///
+  /// Default is false.
+  ///
+  /// Note: If you pass in `true` make sure to add localhost and any [`registrable
+  /// domains`](https://developer.mozilla.org/en-US/docs/Glossary/Registrable_domain)
+  /// used in this webview to tauri-src/Info.ios.plist:
+  ///
+  /// ```xml
+  /// <plist>
+  /// <dict>
+  ///     <key>WKAppBoundDomains</key>
+  ///     <array>
+  ///         <string>localhost</string>
+  ///         <string>aregistrabledomain.example</string>
+  ///     </array>
+  /// </dict>
+  /// </plist>
+  /// ```
+  ///
+  /// You must add `localhost` if any webview with this set to true opens a
+  /// local webpage, makes any localhost calls, or uses the isolation pattern
+  /// because Tauri uses the `localhost` domain for hosting the application
+  /// webpage, the IPC protocol, and the isolation pattern's iframe.
+  ///
+  /// Requests served through custom uri schemes are allowed so long as they use
+  /// a registrable domain specified in the `WKAppBoundDomains` array for all the
+  /// requests from the app, including requests for the `localhost` domain.
+  ///
+  /// In theory, you can whitelist an entire uri scheme by including the
+  /// protocol name followed by a colon. For example, to allow all requests
+  /// using a custom "stream" uri scheme (see [this tauri
+  /// example](https://github.com/tauri-apps/tauri/blob/dev/examples/streaming/main.rs)),
+  /// you could add `stream:` to the AppBoundDomains array. That said, I'm not
+  /// sure whether Apple would let your app through app review if you do
+  /// whitelist an entire protocol because this feature is not mentioned in
+  /// [their blog post on App-Bound
+  /// Domains](https://webkit.org/blog/10882/app-bound-domains/).
+  ///
+  /// See https://webkit.org/blog/10882/app-bound-domains/ and
+  /// https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/limitsnavigationstoappbounddomains
+  /// for the official documentation on App-Bound Domains.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS**: Supported since version 14.0+.
+  /// - **Linux / Windows / Android / MacOS:** Unsupported.
+  #[must_use]
+  #[allow(unused_variables, unused_mut)]
+  pub fn limit_navigations_to_app_bound_domains(mut self, limit_navigations: bool) -> Self {
+    #[cfg(target_os = "ios")]
+    {
+      self.limit_navigations_to_app_bound_domains = limit_navigations;
+    }
+    self
+  }
+
   /// Change the default background throttling behavior.
   ///
   /// By default, browsers use a suspend policy that will throttle timers and even unload
@@ -729,7 +885,7 @@ impl WebviewAttributes {
   /// - **iOS**: Supported since version 17.0+.
   /// - **macOS**: Supported since version 14.0+.
   ///
-  /// see https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578
+  /// see <https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578>
   #[must_use]
   pub fn background_throttling(mut self, policy: Option<BackgroundThrottlingPolicy>) -> Self {
     self.background_throttling = policy;
@@ -754,10 +910,59 @@ impl WebviewAttributes {
     self.scroll_bar_style = style;
     self
   }
+
+  /// Controls the WebView's browser-level general autofill behavior.
+  ///
+  /// **This option does not disable password or credit card autofill.**
+  ///
+  /// When set to `false`, the WebView will not automatically populate
+  /// general form fields using previously stored data such as addresses
+  /// or contact information.
+  ///
+  /// By default, this is `true`.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows**: Supported. WebView2's autofill feature (called
+  ///   "Suggestions") may not honor `autocomplete="off"` on input
+  ///   elements in some cases.
+  /// - **Linux / Android / iOS / macOS**: Unsupported and performs no
+  ///   operation.
+  #[must_use]
+  pub fn general_autofill_enabled(mut self, enabled: bool) -> Self {
+    self.general_autofill_enabled = enabled;
+    self
+  }
 }
 
 /// IPC handler.
 pub type WebviewIpcHandler<T, R> = Box<dyn Fn(DetachedWebview<T, R>, Request<String>) + Send>;
+
+/// The page script that binds the DevTools keyboard shortcut - Ctrl+Shift+I, or
+/// Cmd+Alt+I on macOS - to the `webview` plugin's `internal_toggle_devtools` command.
+///
+/// It is up to each runtime to inject this into the webviews it creates, and only into
+/// the ones that have no shortcut of their own:
+///
+/// * `tauri-runtime-wry` injects it always. None of the webviews it drives - WebView2,
+///   WKWebView, WebKitGTK - binds the chord itself.
+/// * `tauri-runtime-cef` injects it only into Alloy style browsers. A Chrome style one
+///   already dispatches `IDC_DEV_TOOLS` for the same chord, and with both in place the
+///   toggle closes the window the accelerator just opened.
+///
+/// Returns the script with its one template value resolved for the target this crate
+/// was compiled for.
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub fn devtools_shortcut_script() -> String {
+  include_str!("scripts/toggle-devtools.js").replace(
+    "__TEMPLATE_is_macos__",
+    if cfg!(target_os = "macos") {
+      "true"
+    } else {
+      "false"
+    },
+  )
+}
 
 /// An initialization script
 #[derive(Debug, Clone)]

@@ -17,7 +17,10 @@ const MAX_LEN_PREFIX: usize = 64 - PLUGIN_PREFIX.len();
 const MAX_LEN_BASE: usize = 64;
 const MAX_LEN_IDENTIFIER: usize = MAX_LEN_PREFIX + 1 + MAX_LEN_BASE;
 
-/// Plugin identifier.
+/// Permission identifier.
+///
+/// Typically used in the [`permissions`](crate::acl::Capability::permissions) field of a capability file.
+/// (e.g. `core:default`, `sample:allow-ping-scoped`)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identifier {
   inner: String,
@@ -93,7 +96,8 @@ impl ValidByte {
   }
 
   fn alpha_numeric_hyphen(byte: u8) -> Option<Self> {
-    (byte.is_ascii_alphanumeric() || byte == b'-').then_some(Self::Byte(byte))
+    // `*` is allowed so the implicit `allow-*`/`deny-*` wildcard command permissions can be referenced
+    (byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'*').then_some(Self::Byte(byte))
   }
 
   fn next(&self, next: u8) -> Option<ValidByte> {
@@ -214,7 +218,12 @@ impl<'de> Deserialize<'de> for Identifier {
   where
     D: Deserializer<'de>,
   {
-    Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    let raw = String::deserialize(deserializer)?;
+    Self::try_from(raw.clone()).map_err(|e| {
+      serde::de::Error::custom(format!(
+        "invalid plugin or permission identifier '{raw}': {e}"
+      ))
+    })
   }
 }
 
@@ -259,6 +268,11 @@ mod tests {
     assert!(ident("prefix:base--sep").is_ok());
     assert!(ident("pre--fix:base").is_ok());
 
+    // wildcard command permissions
+    assert!(ident("allow-*").is_ok());
+    assert!(ident("deny-*").is_ok());
+    assert!(ident("prefix:allow-*").is_ok());
+
     assert!(ident("prefix::base").is_err());
     assert!(ident(":base").is_err());
     assert!(ident("prefix:").is_err());
@@ -284,7 +298,7 @@ mod tests {
   }
 }
 
-#[cfg(feature = "build")]
+#[cfg(any(feature = "build", feature = "build-2"))]
 mod build {
   use proc_macro2::TokenStream;
   use quote::{ToTokens, TokenStreamExt, quote};

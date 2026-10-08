@@ -62,6 +62,26 @@ pub enum WindowEvent {
   ///
   /// Applications might wish to react to this to change the theme of the content of the window when the system changes the window theme.
   ThemeChanged(Theme),
+
+  /// Emitted when the application has been suspended.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android**: This is triggered by `onPause` method of the Activity.
+  /// - **iOS**: This is triggered by `applicationWillResignActive` method of the UIApplicationDelegate.
+  /// - **Linux / macOS / Windows**: Unsupported.
+  #[cfg(mobile)]
+  Suspended,
+
+  /// Emitted when the application has been resumed.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Android**: This is triggered by `onResume` method of the Activity. The first onResume() is ignored to match the iOS implementation, since that is called on activity creation.
+  /// - **iOS**: This is triggered by `applicationWillEnterForeground` method of the UIApplicationDelegate.
+  /// - **Linux / macOS / Windows**: Unsupported.
+  #[cfg(mobile)]
+  Resumed,
 }
 
 /// An event from a window.
@@ -230,7 +250,7 @@ pub struct WindowSizeConstraints {
 /// Do **NOT** implement this trait except for use in a custom [`Runtime`]
 ///
 /// This trait is separate from [`WindowBuilder`] to prevent "accidental" implementation.
-pub trait WindowBuilderBase: std::fmt::Debug + Clone + Sized {}
+pub trait WindowBuilderBase: std::fmt::Debug + Clone + Sized + 'static {}
 
 /// A builder for all attributes related to a single window.
 ///
@@ -343,6 +363,9 @@ pub trait WindowBuilder: WindowBuilderBase {
 
   /// Whether the window should be transparent. If this is true, writing colors
   /// with alpha values different than `1.0` will produce a transparent window.
+  ///
+  /// On Windows, using `no_redirection_bitmap` can help avoid a white flash when
+  /// creating a transparent window.
   #[cfg(any(not(target_os = "macos"), feature = "macos-private-api"))]
   #[cfg_attr(
     docsrs,
@@ -425,6 +448,12 @@ pub trait WindowBuilder: WindowBuilderBase {
   /// Sets the window to be created transient for parent.
   ///
   /// See <https://docs.gtk.org/gtk3/method.Window.set_transient_for.html>
+  ///
+  /// # Ownership
+  ///
+  /// `parent` is a `GtkWindow*` passed as *transfer full*: the implementation takes ownership of
+  /// the strong reference and must release it (`g_object_unref`, i.e. glib's `from_glib_full`),
+  /// including when it does not support transient windows.
   #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -432,7 +461,7 @@ pub trait WindowBuilder: WindowBuilderBase {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  fn transient_for(self, parent: &impl gtk::glib::IsA<gtk::Window>) -> Self;
+  fn transient_for(self, parent: *mut std::ffi::c_void) -> Self;
 
   /// Enables or disables drag and drop support.
   #[cfg(windows)]
@@ -477,6 +506,30 @@ pub trait WindowBuilder: WindowBuilderBase {
   /// Sets custom name for Windows' window class. **Windows only**.
   #[must_use]
   fn window_classname<S: Into<String>>(self, window_classname: S) -> Self;
+
+  /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
+  ///
+  /// This can avoid the white flash that may appear before the webview content is rendered
+  /// when using a transparent window. **Windows only**.
+  #[must_use]
+  fn no_redirection_bitmap(self, enable: bool) -> Self;
+
+  /// The name of the activity to create for this webview window.
+  #[cfg(target_os = "android")]
+  fn activity_name<S: Into<String>>(self, class_name: S) -> Self;
+
+  /// Sets the name of the activity that is creating this webview window.
+  ///
+  /// This is important to determine which stack the activity will belong to.
+  #[cfg(target_os = "android")]
+  fn created_by_activity_name<S: Into<String>>(self, class_name: S) -> Self;
+
+  /// Sets the identifier of the UIScene that is requesting the creation of this new scene,
+  /// establishing a relationship between the two scenes.
+  ///
+  /// By default the system uses the foreground scene.
+  #[cfg(target_os = "ios")]
+  fn requested_by_scene_identifier<S: Into<String>>(self, identifier: S) -> Self;
 }
 
 /// A window that has yet to be built.
@@ -559,6 +612,8 @@ pub struct DetachedWindow<T: UserEvent, R: Runtime<T>> {
 pub struct DetachedWindowWebview<T: UserEvent, R: Runtime<T>> {
   pub webview: DetachedWebview<T, R>,
   pub use_https_scheme: bool,
+  /// Whether devtools was enabled in [`crate::webview::WebviewAttributes`]. `Some(false)` disables the inspector.
+  pub devtools: Option<bool>,
 }
 
 impl<T: UserEvent, R: Runtime<T>> Clone for DetachedWindowWebview<T, R> {
@@ -566,6 +621,7 @@ impl<T: UserEvent, R: Runtime<T>> Clone for DetachedWindowWebview<T, R> {
     Self {
       webview: self.webview.clone(),
       use_https_scheme: self.use_https_scheme,
+      devtools: self.devtools,
     }
   }
 }
@@ -597,10 +653,23 @@ impl<T: UserEvent, R: Runtime<T>> PartialEq for DetachedWindow<T, R> {
 }
 
 /// A raw window type that contains fields to access
-/// the HWND on Windows, gtk::ApplicationWindow on Linux
+/// the HWND on Windows, GTK object pointers on Linux
+///
+/// # Ownership
+///
+/// Unlike the [`WindowDispatch`](crate::WindowDispatch) getters, the GTK pointers here are
+/// *transfer none*: they are borrowed from the window that is being created and are only valid for
+/// the duration of the callback that receives this struct. Wrap them with glib's `from_glib_none`
+/// (which takes its own reference) and do not store them - the `'a` lifetime is not enforced by
+/// the raw pointers, so retaining one past the callback dereferences freed memory.
+///
+/// The GTK major version of the objects is the one the runtime was built against, so consumers must
+/// wrap them with matching bindings.
 pub struct RawWindow<'a> {
+  /// The window handle on Windows.
   #[cfg(windows)]
   pub hwnd: isize,
+  /// A borrowed `GtkApplicationWindow*`. Never null.
   #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -608,7 +677,9 @@ pub struct RawWindow<'a> {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  pub gtk_window: &'a gtk::ApplicationWindow,
+  pub gtk_window: *mut std::ffi::c_void,
+  /// A borrowed `GtkBox*`, or [`None`] when the runtime does not add a default vertical box.
+  /// When set, it is never null.
   #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -616,6 +687,7 @@ pub struct RawWindow<'a> {
     target_os = "netbsd",
     target_os = "openbsd"
   ))]
-  pub default_vbox: Option<&'a gtk::Box>,
+  pub default_vbox: Option<*mut std::ffi::c_void>,
+  /// Ties this struct to the lifetime of the window the pointers above are borrowed from.
   pub _marker: &'a PhantomData<()>,
 }

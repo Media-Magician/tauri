@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{env::var, sync::OnceLock};
+use std::env::var;
 
 use heck::{ToLowerCamelCase, ToSnakeCase};
 use proc_macro::TokenStream;
@@ -40,6 +40,7 @@ struct WrapperAttributes {
   root: TokenStream2,
   execution_context: ExecutionContext,
   argument_case: ArgumentCase,
+  rename: RenamePolicy,
 }
 
 impl Parse for WrapperAttributes {
@@ -48,6 +49,7 @@ impl Parse for WrapperAttributes {
       root: quote!(::tauri),
       execution_context: ExecutionContext::Blocking,
       argument_case: ArgumentCase::Camel,
+      rename: RenamePolicy::Keep,
     };
 
     let attrs = Punctuated::<WrapperAttributeKind, Token![,]>::parse_terminated(input)?;
@@ -57,23 +59,29 @@ impl Parse for WrapperAttributes {
           return Err(syn::Error::new(input.span(), "unexpected list input"));
         }
         WrapperAttributeKind::Meta(Meta::NameValue(v)) => {
-          if v.path.is_ident("rename_all") {
-            if let Expr::Lit(ExprLit {
+          if v.path.is_ident("rename_all")
+            && let Expr::Lit(ExprLit {
               lit: Lit::Str(s),
               attrs: _,
             }) = v.value
-            {
-              wrapper_attributes.argument_case = match s.value().as_str() {
-                "snake_case" => ArgumentCase::Snake,
-                "camelCase" => ArgumentCase::Camel,
-                _ => {
-                  return Err(syn::Error::new(
-                    s.span(),
-                    "expected \"camelCase\" or \"snake_case\"",
-                  ));
-                }
-              };
-            }
+          {
+            wrapper_attributes.argument_case = match s.value().as_str() {
+              "snake_case" => ArgumentCase::Snake,
+              "camelCase" => ArgumentCase::Camel,
+              _ => {
+                return Err(syn::Error::new(
+                  s.span(),
+                  "expected \"camelCase\" or \"snake_case\"",
+                ));
+              }
+            };
+          } else if v.path.is_ident("rename")
+            && let Expr::Lit(ExprLit {
+              lit: Lit::Str(s), ..
+            }) = v.value
+          {
+            let lit = s.value();
+            wrapper_attributes.rename = RenamePolicy::Rename(quote!(#lit));
           } else if v.path.is_ident("root")
             && let Expr::Lit(ExprLit {
               lit: Lit::Str(s),
@@ -93,7 +101,7 @@ impl Parse for WrapperAttributes {
         WrapperAttributeKind::Meta(Meta::Path(_)) => {
           return Err(syn::Error::new(
             input.span(),
-            "unexpected input, expected one of `rename_all`, `root`, `async`",
+            "unexpected input, expected one of `rename_all`, `rename`, `root`, `async`",
           ));
         }
         WrapperAttributeKind::Async => {
@@ -119,6 +127,12 @@ enum ArgumentCase {
   Camel,
 }
 
+/// The rename policy for the command.
+enum RenamePolicy {
+  Keep,
+  Rename(TokenStream2),
+}
+
 /// The bindings we attach to `tauri::Invoke`.
 struct Invoke {
   message: Ident,
@@ -137,9 +151,11 @@ pub fn wrapper(attributes: TokenStream, item: TokenStream) -> TokenStream {
     attrs.execution_context = ExecutionContext::Async;
   }
 
-  // macros used with `pub use my_macro;` need to be exported with `#[macro_export]`
+  // macros used with `pub use my_macro;` need to be exported with `#[macro_export]`.
   let maybe_macro_export = match &function.vis {
-    Visibility::Public(_) | Visibility::Restricted(_) => quote!(#[macro_export]),
+    Visibility::Public(_) | Visibility::Restricted(_) => {
+      quote!(#[macro_export])
+    }
     _ => TokenStream2::default(),
   };
 
@@ -186,13 +202,7 @@ pub fn wrapper(attributes: TokenStream, item: TokenStream) -> TokenStream {
             // only implemented by `Result`. That way we don't exclude renamed result types
             // which we wouldn't otherwise be able to detect purely from the token stream.
             // The "error message" displayed to the user is simply the trait name.
-            //
-            // TODO: remove this check once our MSRV is high enough
-            let diagnostic = if is_rustc_at_least(1, 78) {
-              quote!(#[diagnostic::on_unimplemented(message = "async commands that contain references as inputs must return a `Result`")])
-            } else {
-              quote!()
-            };
+            let diagnostic = quote!(#[diagnostic::on_unimplemented(message = "async commands that contain references as inputs must return a `Result`")]);
 
             async_command_check = quote_spanned! {return_type.span() =>
               #[allow(unreachable_code, clippy::diverging_sub_expression, clippy::used_underscore_binding)]
@@ -268,12 +278,34 @@ pub fn wrapper(attributes: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream2::default()
   };
 
+  // Always define a hidden macro that returns the externally invoked command name.
+  // This lets the handler match on the renamed string while the original function
+  // identifier remains usable in `generate_handler![original_fn_name]`.
+  let command_name_macro_ident = format_ident!("__tauri_command_name_{}", function.sig.ident);
+  let command_name_value = if let RenamePolicy::Rename(ref rename) = attrs.rename {
+    quote!(#rename)
+  } else {
+    let ident = &function.sig.ident;
+    quote!(stringify!(#ident))
+  };
+
   // Rely on rust 2018 edition to allow importing a macro from a path.
   quote!(
     #async_command_check
 
     #maybe_allow_unused
     #function
+
+    // Command name macro used by the handler for pattern matching.
+    // This macro returns the command name string literal (renamed or original).
+    #maybe_allow_unused
+    #maybe_macro_export
+    #[doc(hidden)]
+    macro_rules! #command_name_macro_ident {
+      () => {
+        #command_name_value
+      };
+    }
 
     #maybe_allow_unused
     #maybe_macro_export
@@ -301,7 +333,7 @@ pub fn wrapper(attributes: TokenStream, item: TokenStream) -> TokenStream {
 
     // allow the macro to be resolved with the same path as the command function
     #[allow(unused_imports)]
-    #visibility use #wrapper;
+    #visibility use {#wrapper, #command_name_macro_ident};
   )
   .into()
 }
@@ -465,56 +497,19 @@ fn parse_arg(
   }
 
   let root = &attributes.root;
+  let command_name = if let RenamePolicy::Rename(r) = &attributes.rename {
+    quote!(stringify!(#r))
+  } else {
+    quote!(stringify!(#command))
+  };
 
   Ok(quote!(#root::ipc::CommandArg::from_command(
     #root::ipc::CommandItem {
       plugin: #plugin_name,
-      name: stringify!(#command),
+      name: #command_name,
       key: #key,
       message: &#message,
       acl: &#acl,
     }
   )))
-}
-
-fn is_rustc_at_least(major: u32, minor: u32) -> bool {
-  let version = rustc_version();
-  version.0 >= major && version.1 >= minor
-}
-
-fn rustc_version() -> &'static (u32, u32) {
-  static RUSTC_VERSION: OnceLock<(u32, u32)> = OnceLock::new();
-  RUSTC_VERSION.get_or_init(|| {
-    cross_command("rustc")
-      .arg("-V")
-      .output()
-      .ok()
-      .and_then(|o| {
-        let version = String::from_utf8_lossy(&o.stdout)
-          .trim()
-          .split(' ')
-          .nth(1)
-          .unwrap_or_default()
-          .split('.')
-          .take(2)
-          .flat_map(|p| p.parse::<u32>().ok())
-          .collect::<Vec<_>>();
-        version
-          .first()
-          .and_then(|major| version.get(1).map(|minor| (*major, *minor)))
-      })
-      .unwrap_or((1, 0))
-  })
-}
-
-fn cross_command(bin: &str) -> std::process::Command {
-  #[cfg(target_os = "windows")]
-  let cmd = {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.arg("/c").arg(bin);
-    cmd
-  };
-  #[cfg(not(target_os = "windows"))]
-  let cmd = std::process::Command::new(bin);
-  cmd
 }

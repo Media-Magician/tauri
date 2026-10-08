@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use super::{AppSettings, DevProcess, ExitReason, Options, RustAppSettings, RustupTarget};
+use super::{AppSettings, DevProcess, ExitReason, Options, Rust, RustAppSettings, RustupTarget};
+use crate::helpers::app_paths::Dirs;
 use crate::{
   CommandExt, Error,
   error::{Context, ErrorExt},
@@ -43,18 +44,19 @@ impl DevProcess for DevChild {
 }
 
 pub fn run_dev<F: Fn(Option<i32>, ExitReason) + Send + Sync + 'static>(
-  app_settings: &RustAppSettings,
+  interface: &Rust,
   options: Options,
   run_args: &[String],
   available_targets: &mut Option<Vec<RustupTarget>>,
   config_features: Vec<String>,
   on_exit: F,
-  #[allow(unused_variables)] tauri_dir: &Path,
+  #[allow(unused_variables)] dirs: &Dirs,
 ) -> crate::Result<DevChild> {
   #[cfg(not(target_os = "macos"))]
-  let _app_settings = app_settings;
+  let _interface = interface;
   #[cfg(target_os = "macos")]
   {
+    let app_settings = interface.app_settings_ref();
     // compute enabled features by merging config_features and options.features, then asking the manifest
     let mut merged_features = config_features.clone();
     merged_features.extend(options.features.clone());
@@ -62,22 +64,19 @@ pub fn run_dev<F: Fn(Option<i32>, ExitReason) + Send + Sync + 'static>(
     if !no_default_features {
       merged_features.push("default".into());
     }
-    let enabled_features = app_settings
-      .manifest
-      .lock()
-      .unwrap()
-      .all_enabled_features(&merged_features);
-    let cef_enabled = enabled_features.contains(&"cef".to_string())
-      || enabled_features.contains(&"tauri/cef".to_string());
-    if cef_enabled {
-      return crate::cef::macos_dev::run_dev_cef_macos(
+    if app_settings
+      .runtime(&merged_features)
+      .macos_dev_in_app_bundle()
+    {
+      return crate::runtime::macos_dev::run_dev_in_app_bundle(
         app_settings,
         options,
         run_args,
         available_targets,
         config_features.clone(),
         on_exit,
-        tauri_dir,
+        interface,
+        dirs,
       );
     }
   }
@@ -111,7 +110,7 @@ pub fn run_dev<F: Fn(Option<i32>, ExitReason) + Send + Sync + 'static>(
   let manually_killed_app = Arc::new(AtomicBool::default());
   let manually_killed_app_ = manually_killed_app.clone();
 
-  log::info!(action = "Running"; "DevCommand (`{} {}`)", &dev_cmd.get_program().to_string_lossy(), dev_cmd.get_args().map(|arg| arg.to_string_lossy()).fold(String::new(), |acc, arg| format!("{acc} {arg}")));
+  log::info!(action = "Running"; "DevCommand (`{} {}`)", dev_cmd.get_program().to_string_lossy(), dev_cmd.get_args().map(|arg| arg.to_string_lossy()).fold(String::new(), |acc, arg| format!("{acc} {arg}")));
 
   let dev_child = match SharedChild::spawn(&mut dev_cmd) {
     Ok(c) => Ok(c),
@@ -191,10 +190,6 @@ pub fn build(
   let out_dir = app_settings.out_dir(&options, tauri_dir)?;
   let bin_path = app_settings.app_binary_path(&options, tauri_dir)?;
 
-  if std::env::var_os("STATIC_VCRUNTIME").is_none_or(|v| v != "false") {
-    unsafe { std::env::set_var("STATIC_VCRUNTIME", "true") };
-  }
-
   if options.target == Some("universal-apple-darwin".into()) {
     std::fs::create_dir_all(&out_dir)
       .fs_context("failed to create project out directory", out_dir.clone())?;
@@ -270,6 +265,10 @@ pub fn cargo_command(
 
   let mut build_cmd = Command::new(runner_config.cmd());
   build_cmd.arg(if dev { "run" } else { "build" });
+
+  // Ensure CEF_PATH is set for the cargo subprocess so the cef-dll-sys build
+  // script can locate (or download) the CEF binary distribution.
+  build_cmd.env("CEF_PATH", crate::runtime::cef::cef_path_env());
 
   // Set working directory if specified
   if let Some(cwd) = runner_config.cwd() {

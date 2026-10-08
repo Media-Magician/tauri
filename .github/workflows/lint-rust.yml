@@ -12,6 +12,8 @@ on:
     paths:
       - '.github/workflows/lint-rust.yml'
       - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 env:
   RUST_BACKTRACE: 1
@@ -21,23 +23,75 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   clippy:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cargo: 'cargo'
+            include: ''
+            features: '--all-features'
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cargo: 'cargo'
+            include: ''
+            features: '--all-features'
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cargo: 'cargo'
+            include: ''
+            features: '--all-features'
+          - target: aarch64-apple-ios
+            os: macos-latest
+            cargo: 'cargo'
+            # api example crate should pull in every dependency we want to lint on mobile
+            include: '--package api '
+            # cannot use --all-features: the `cef` feature pulls in tauri-runtime-cef, which is desktop-only
+            features: '--features prod'
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            cargo: 'cross'
+            # api example crate should pull in every dependency we want to lint on mobile
+            include: '--package api '
+            # cannot use --all-features: the `cef` feature pulls in tauri-runtime-cef, which is desktop-only
+            features: '--features prod'
+
+    runs-on: ${{ matrix.platform.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install rust stable and clippy
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: ${{ matrix.platform.target }}
 
-      - name: install dependencies
+      # tauri-bundler embeds CEF helpers for both macOS architectures.
+      - name: install CEF helper targets
+        if: contains(matrix.platform.target, 'apple-darwin')
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: install Linux dependencies
+        if: contains(matrix.platform.target, 'unknown-linux')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev webkit2gtk-4.1 libayatana-appindicator3-dev
+          sudo apt-get install -y libgtk-3-dev libgtk-4-dev webkit2gtk-4.1 libayatana-appindicator3-dev
+
+      - name: Install cross
+        if: ${{ matrix.platform.cargo == 'cross' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform.target }}
 
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: ${{ matrix.platform.cargo }} clippy --target ${{ matrix.platform.target }} ${{ matrix.platform.include }}--all-targets ${{ matrix.platform.features }} -- -D warnings

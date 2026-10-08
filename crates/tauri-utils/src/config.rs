@@ -24,7 +24,7 @@
 //! [Struct Update Syntax]: https://doc.rust-lang.org/book/ch05-01-defining-structs.html#creating-instances-from-other-instances-with-struct-update-syntax
 
 #[cfg(feature = "schema")]
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use semver::Version;
 use serde::{
   Deserialize, Serialize, Serializer,
@@ -36,21 +36,12 @@ use serde_with::skip_serializing_none;
 use url::Url;
 
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, HashMap, HashSet},
   fmt::{self, Display},
   fs::read_to_string,
   path::PathBuf,
   str::FromStr,
 };
-
-#[cfg(feature = "schema")]
-fn add_description(mut schema: Schema, description: impl Into<String>) -> Schema {
-  let value = description.into();
-  if !value.is_empty() {
-    schema.insert("description".to_string(), serde_json::Value::String(value));
-  }
-  schema
-}
 
 /// Items to help with parsing content into a [`Config`].
 pub mod parse;
@@ -203,43 +194,21 @@ impl<'de> Deserialize<'de> for BundleType {
 
 /// Targets to bundle. Each value is case insensitive.
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[cfg_attr(
+  feature = "schema",
+  derive(JsonSchema),
+  schemars(rename_all = "lowercase")
+)]
 pub enum BundleTarget {
   /// Bundle all targets.
   #[default]
   All,
+  #[cfg_attr(feature = "schema", schemars(untagged))]
   /// A list of bundle targets.
   List(Vec<BundleType>),
+  #[cfg_attr(feature = "schema", schemars(untagged))]
   /// A single bundle target.
   One(BundleType),
-}
-
-#[cfg(feature = "schema")]
-impl schemars::JsonSchema for BundleTarget {
-  fn schema_name() -> std::borrow::Cow<'static, str> {
-    "BundleTarget".into()
-  }
-
-  fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    let any_of: Vec<serde_json::Value> = vec![
-      serde_json::json!({
-        "const": "all",
-        "description": "Bundle all targets."
-      }),
-      serde_json::Value::from(add_description(
-        generator.subschema_for::<Vec<BundleType>>(),
-        "A list of bundle targets.",
-      )),
-      serde_json::Value::from(add_description(
-        generator.subschema_for::<BundleType>(),
-        "A single bundle target.",
-      )),
-    ];
-
-    schemars::json_schema!({
-      "anyOf": any_of,
-      "description": "Targets to bundle. Each value is case insensitive."
-    })
-  }
 }
 
 impl Serialize for BundleTarget {
@@ -677,7 +646,7 @@ fn macos_minimum_system_version() -> Option<String> {
 }
 
 fn ios_minimum_system_version() -> String {
-  "14.0".into()
+  "15.0".into()
 }
 
 /// Configuration for a target language for the WiX build.
@@ -841,13 +810,24 @@ pub struct NsisConfig {
   /// The recommended dimensions are 164px x 314px.
   #[serde(alias = "sidebar-image")]
   pub sidebar_image: Option<PathBuf>,
+  // TODO: Change the alias to installer-icon in v3
   /// The path to an icon file used as the installer icon.
   #[serde(alias = "install-icon")]
   pub installer_icon: Option<PathBuf>,
+  /// The path to an icon file used as the uninstaller icon.
+  #[serde(alias = "uninstaller-icon")]
+  pub uninstaller_icon: Option<PathBuf>,
+  /// The path to a bitmap file to display on the header of uninstallers pages.
+  /// Defaults to [`Self::header_image`]. If this is set but [`Self::header_image`] is not, a default image from NSIS will be applied to `header_image`
+  ///
+  /// The recommended dimensions are 150px x 57px.
+  #[serde(alias = "uninstaller-header-image")]
+  pub uninstaller_header_image: Option<PathBuf>,
   /// Whether the installation will be for all users or just the current user.
   #[serde(default, alias = "install-mode")]
   pub install_mode: NSISInstallerMode,
-  /// A list of installer languages.
+  /// A list of installer languages. Default to `["English"]` if not set.
+  ///
   /// By default the OS language is used. If the OS language is not in the list of languages, the first language will be used.
   /// To allow the user to select the language, set `display_language_selector` to `true`.
   ///
@@ -858,7 +838,7 @@ pub struct NsisConfig {
   ///
   /// See <https://github.com/tauri-apps/tauri/blob/dev/crates/tauri-bundler/src/bundle/windows/nsis/languages/English.nsh> for an example `.nsh` file.
   ///
-  /// **Note**: the key must be a valid NSIS language and it must be added to [`NsisConfig`] languages array,
+  /// **Note**: the key must be a valid NSIS language and it must be added to the [`Self::languages`] array,
   pub custom_language_files: Option<HashMap<String, PathBuf>>,
   /// Whether to display a language selector dialog before the installer and uninstaller windows are rendered or not.
   /// By default the OS language is selected, with a fallback to the first language in the `languages` array.
@@ -910,9 +890,15 @@ pub struct NsisConfig {
   /// ```
   #[serde(alias = "installer-hooks")]
   pub installer_hooks: Option<PathBuf>,
+  /// Deprecated: use [`WindowsConfig::minimum_webview2_version`] (`bundle >  windows > minimumWebview2Version`) instead.
+  ///
   /// Try to ensure that the WebView2 version is equal to or newer than this version,
   /// if the user's WebView2 is older than this version,
   /// the installer will try to trigger a WebView2 update.
+  #[deprecated(
+    since = "2.10.0",
+    note = "Use `WindowsConfig::minimum_webview2_version` instead."
+  )]
   #[serde(alias = "minimum-webview2-version")]
   pub minimum_webview2_version: Option<String>,
 }
@@ -1027,6 +1013,11 @@ pub struct WindowsConfig {
   /// The default value of this flag is `true`.
   #[serde(default = "default_true", alias = "allow-downgrades")]
   pub allow_downgrades: bool,
+  /// Try to ensure that the WebView2 version is equal to or newer than this version,
+  /// if the user's WebView2 is older than this version,
+  /// the installer will try to trigger a WebView2 update.
+  #[serde(alias = "minimum-webview2-version")]
+  pub minimum_webview2_version: Option<String>,
   /// Configuration for the MSI generated with WiX.
   pub wix: Option<WixConfig>,
   /// Configuration for the installer generated with NSIS.
@@ -1040,6 +1031,19 @@ pub struct WindowsConfig {
   /// need to use another tool like `osslsigncode`.
   #[serde(alias = "sign-command")]
   pub sign_command: Option<CustomSignCommandConfig>,
+  /// Whether to bundle the Visual C++ runtime DLLs alongside the application.
+  ///
+  /// This can be particularly useful when your application includes sidecars or DLLs that do
+  /// not statically link the Visual C++ runtime and require the runtime DLLs at runtime, and
+  /// you do not want to require users to install the Visual C++ Redistributable. This can also
+  /// be useful when `build > windows > staticVCRuntime` is set to `false`.
+  #[serde(
+    default,
+    rename = "bundleVCRuntime",
+    alias = "bundle-vc-runtime",
+    alias = "bundleVcRuntime"
+  )]
+  pub bundle_vc_runtime: bool,
 }
 
 impl Default for WindowsConfig {
@@ -1051,9 +1055,11 @@ impl Default for WindowsConfig {
       tsp: false,
       webview_install_mode: Default::default(),
       allow_downgrades: true,
+      minimum_webview2_version: None,
       wix: None,
       nsis: None,
       sign_command: None,
+      bundle_vc_runtime: false,
     }
   }
 }
@@ -1159,7 +1165,13 @@ pub struct FileAssociation {
   /// The app's role with respect to the type. Maps to `CFBundleTypeRole` on macOS.
   #[serde(default)]
   pub role: BundleTypeRole,
-  /// The mime-type e.g. 'image/png' or 'text/plain'. Linux-only.
+  /// The mime-type of the association, e.g. `'image/png'` or `'text/plain'`.
+  ///
+  /// - **Linux**: written as `MimeType=` in the `.desktop` file.
+  /// - **macOS / iOS**: added as `public.mime-type` in the `UTTypeTagSpecification` dictionary of
+  ///   the `UTExportedTypeDeclarations` entry in `Info.plist`.
+  /// - **Android**: used as `android:mimeType` in the `<data>` element of an `<intent-filter>`
+  ///   in `AndroidManifest.xml`.
   #[serde(alias = "mime-type")]
   pub mime_type: Option<String>,
   /// The ranking of this app among apps that declare themselves as editors or viewers of the given file type.  Maps to `LSHandlerRank` on macOS.
@@ -1169,6 +1181,31 @@ pub struct FileAssociation {
   ///
   /// You should define this if the associated file is a custom file type defined by your application.
   pub exported_type: Option<ExportedFileAssociation>,
+  /// Intent action filters for this file association.
+  ///
+  /// By default all filters are used.
+  #[serde(alias = "android-intent-action-filters")]
+  pub android_intent_action_filters: Option<Vec<AndroidIntentAction>>,
+}
+
+/// Android intent action.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize, Hash)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum AndroidIntentAction {
+  /// ACTION_SEND.
+  ///
+  /// <https://developer.android.com/reference/android/content/Intent#ACTION_SEND>
+  Send,
+  /// ACTION_SEND_MULTIPLE.
+  ///
+  /// <https://developer.android.com/reference/android/content/Intent#ACTION_SEND_MULTIPLE>
+  SendMultiple,
+  /// ACTION_VIEW.
+  ///
+  /// <https://developer.android.com/reference/android/content/Intent#ACTION_SEND>
+  View,
 }
 
 /// The exported type definition. Maps to a `UTExportedTypeDeclarations` entry on macOS.
@@ -1183,6 +1220,227 @@ pub struct ExportedFileAssociation {
   /// Examples are `public.data`, `public.image`, `public.json` and `public.database`.
   #[serde(alias = "conforms-to")]
   pub conforms_to: Option<Vec<String>>,
+}
+
+impl FileAssociation {
+  /// Infers UTIs (Uniform Type Identifiers) from file extensions and mime types.
+  /// This is useful for macOS and iOS to automatically populate `LSItemContentTypes`
+  /// in the Info.plist for share sheet and file association support.
+  ///
+  /// Returns a vector of UTIs that should be included in `LSItemContentTypes`.
+  /// Explicitly provided content types are included first, followed by inferred types.
+  pub fn infer_content_types(&self) -> HashSet<String> {
+    let mut content_types = HashSet::new();
+
+    // when we have an exported type, we only reference it
+    if let Some(exported_type) = &self.exported_type {
+      content_types.insert(exported_type.identifier.clone());
+      return content_types;
+    }
+
+    // Start with explicitly provided content types
+    if let Some(explicit_types) = &self.content_types {
+      content_types.extend(explicit_types.iter().cloned());
+    }
+
+    // Infer from extensions and add to content_types (avoiding duplicates)
+    for ext in &self.ext {
+      if let Some(uti) = extension_to_uti(&ext.0) {
+        content_types.insert(uti.to_string());
+      }
+    }
+
+    // Also infer from mime type if available (avoiding duplicates)
+    if let Some(mime_type) = &self.mime_type
+      && let Some(uti) = mime_type_to_uti(mime_type)
+    {
+      content_types.insert(uti.to_string());
+    }
+
+    content_types
+  }
+}
+
+/// Generates plist dictionary entries for file associations.
+/// This is used by both macOS and iOS bundlers to populate Info.plist.
+///
+/// Returns a plist dictionary containing `UTExportedTypeDeclarations` and `CFBundleDocumentTypes`
+/// if there are any file associations configured.
+pub fn file_associations_plist(associations: &[FileAssociation]) -> Option<plist::Value> {
+  use plist::{Dictionary, Value};
+
+  if associations.is_empty() {
+    return None;
+  }
+
+  let exported_associations = associations
+    .iter()
+    .filter_map(|association| {
+      association.exported_type.as_ref().map(|exported_type| {
+        let mut dict = Dictionary::new();
+
+        dict.insert(
+          "UTTypeIdentifier".into(),
+          exported_type.identifier.clone().into(),
+        );
+        if let Some(description) = &association.description {
+          dict.insert("UTTypeDescription".into(), description.clone().into());
+        }
+        if let Some(conforms_to) = &exported_type.conforms_to {
+          dict.insert(
+            "UTTypeConformsTo".into(),
+            Value::Array(conforms_to.iter().map(|s| s.clone().into()).collect()),
+          );
+        }
+
+        let mut specification = Dictionary::new();
+        specification.insert(
+          "public.filename-extension".into(),
+          Value::Array(
+            association
+              .ext
+              .iter()
+              .map(|s| s.to_string().into())
+              .collect(),
+          ),
+        );
+        if let Some(mime_type) = &association.mime_type {
+          specification.insert("public.mime-type".into(), mime_type.clone().into());
+        }
+
+        dict.insert("UTTypeTagSpecification".into(), specification.into());
+
+        Value::Dictionary(dict)
+      })
+    })
+    .collect::<Vec<_>>();
+
+  let document_types = associations
+    .iter()
+    .map(|association| {
+      let mut dict = Dictionary::new();
+
+      if !association.ext.is_empty() {
+        dict.insert(
+          "CFBundleTypeExtensions".into(),
+          Value::Array(
+            association
+              .ext
+              .iter()
+              .map(|ext| ext.to_string().into())
+              .collect(),
+          ),
+        );
+      }
+
+      // For macOS/iOS share sheet, we need LSItemContentTypes with standard UTIs
+      let content_types = association.infer_content_types();
+
+      // Add LSItemContentTypes if we have any content types
+      if !content_types.is_empty() {
+        dict.insert(
+          "LSItemContentTypes".into(),
+          Value::Array(content_types.iter().map(|s| s.clone().into()).collect()),
+        );
+      }
+
+      let type_name = association
+        .name
+        .clone()
+        .or_else(|| association.ext.first().map(|ext| ext.0.clone()))
+        .unwrap_or_default();
+      dict.insert("CFBundleTypeName".into(), type_name.into());
+      dict.insert(
+        "CFBundleTypeRole".into(),
+        association.role.to_string().into(),
+      );
+      dict.insert("LSHandlerRank".into(), association.rank.to_string().into());
+
+      Value::Dictionary(dict)
+    })
+    .collect::<Vec<_>>();
+
+  if exported_associations.is_empty() && document_types.is_empty() {
+    return None;
+  }
+
+  let mut plist = Dictionary::new();
+  if !exported_associations.is_empty() {
+    plist.insert(
+      "UTExportedTypeDeclarations".into(),
+      Value::Array(exported_associations),
+    );
+  }
+  if !document_types.is_empty() {
+    plist.insert("CFBundleDocumentTypes".into(), Value::Array(document_types));
+  }
+
+  Some(Value::Dictionary(plist))
+}
+
+/// Maps file extensions to their standard UTIs for macOS/iOS share sheet support
+fn extension_to_uti(ext: &str) -> Option<&'static str> {
+  match ext.to_lowercase().as_str() {
+    // Images
+    "png" => Some("public.png"),
+    "jpg" | "jpeg" => Some("public.jpeg"),
+    "gif" => Some("com.compuserve.gif"),
+    "bmp" => Some("com.microsoft.bmp"),
+    "tiff" | "tif" => Some("public.tiff"),
+    "ico" => Some("com.microsoft.ico"),
+    "heic" | "heif" => Some("public.heif-standard-image"),
+    "webp" => Some("org.webmproject.webp"),
+    "svg" => Some("public.svg-image"),
+    // Videos
+    "mp4" => Some("public.mpeg-4"),
+    "mov" => Some("com.apple.quicktime-movie"),
+    "avi" => Some("public.avi"),
+    "mkv" => Some("public.mpeg-4"),
+    // Audio
+    "mp3" => Some("public.mp3"),
+    "wav" => Some("com.microsoft.waveform-audio"),
+    "aac" => Some("public.aac-audio"),
+    "m4a" => Some("public.mpeg-4-audio"),
+    // Documents
+    "pdf" => Some("com.adobe.pdf"),
+    "txt" => Some("public.plain-text"),
+    "rtf" => Some("public.rtf"),
+    "html" | "htm" => Some("public.html"),
+    "json" => Some("public.json"),
+    "xml" => Some("public.xml"),
+    _ => None,
+  }
+}
+
+/// Infers UTIs from mime type
+fn mime_type_to_uti(mime_type: &str) -> Option<&'static str> {
+  match mime_type {
+    "image/png" => Some("public.png"),
+    "image/jpeg" | "image/jpg" => Some("public.jpeg"),
+    "image/gif" => Some("com.compuserve.gif"),
+    "image/bmp" => Some("com.microsoft.bmp"),
+    "image/tiff" => Some("public.tiff"),
+    "image/heic" | "image/heif" => Some("public.heif-standard-image"),
+    "image/webp" => Some("org.webmproject.webp"),
+    "image/svg+xml" => Some("public.svg-image"),
+    mime if mime.starts_with("image/") => Some("public.image"),
+    "video/mp4" => Some("public.mpeg-4"),
+    "video/quicktime" => Some("com.apple.quicktime-movie"),
+    "video/x-msvideo" => Some("public.avi"),
+    mime if mime.starts_with("video/") => Some("public.movie"),
+    "audio/mpeg" | "audio/mp3" => Some("public.mp3"),
+    "audio/wav" | "audio/wave" => Some("com.microsoft.waveform-audio"),
+    "audio/aac" => Some("public.aac-audio"),
+    "audio/mp4" => Some("public.mpeg-4-audio"),
+    mime if mime.starts_with("audio/") => Some("public.audio"),
+    "application/pdf" => Some("com.adobe.pdf"),
+    "text/plain" => Some("public.plain-text"),
+    "text/rtf" => Some("public.rtf"),
+    "text/html" => Some("public.html"),
+    "application/json" => Some("public.json"),
+    "application/xml" | "text/xml" => Some("public.xml"),
+    _ => None,
+  }
 }
 
 /// Deep link protocol configuration.
@@ -1394,10 +1652,43 @@ pub struct BundleConfig {
   /// Android configuration.
   #[serde(default)]
   pub android: AndroidConfig,
+  /// Configuration for apps using the Chromium Embedded Framework.
+  #[serde(default)]
+  pub cef: CefConfig,
+}
+
+/// Configuration for apps using the Chromium Embedded Framework (the `cef`
+/// feature of the `tauri` crate).
+///
+/// See more: <https://v2.tauri.app/reference/config/#cefconfig>
+#[skip_serializing_none]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CefConfig {
+  /// Whether the CEF binary distribution is embedded in the bundle.
+  /// Defaults to `true`.
+  ///
+  /// Set it to `false` for an app that loads CEF at run time from outside
+  /// its own bundle — a shared, machine-wide runtime, through the
+  /// `TAURI_CEF_LIBRARY_PATH` environment variable. The framework,
+  /// `libcef` and their resources are then left out of every bundle, and
+  /// the app must find a runtime at launch or it will not start. On macOS
+  /// the helper apps are still produced: they belong to the app, not to
+  /// the distribution.
+  #[serde(default = "default_true")]
+  pub embed: bool,
+}
+
+impl Default for CefConfig {
+  fn default() -> Self {
+    Self { embed: true }
+  }
 }
 
 /// A tuple struct of RGBA colors. Each value has minimum of 0 and maximum of 255.
 #[derive(Debug, PartialEq, Eq, Serialize, Default, Clone, Copy)]
+#[cfg_attr(feature = "schema", derive(JsonSchema), schemars(with = "InnerColor"))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Color(pub u8, pub u8, pub u8, pub u8);
 
@@ -1454,7 +1745,6 @@ impl FromStr for Color {
   fn from_str(mut color: &str) -> Result<Self, Self::Err> {
     color = color.trim().strip_prefix('#').unwrap_or(color);
     let color = match color.len() {
-      // TODO: use repeat_n once our MSRV is bumped to 1.82
       3 => color.chars()
             .flat_map(|c| std::iter::repeat_n(c, 2))
             .chain(std::iter::repeat_n('f', 2))
@@ -1482,7 +1772,13 @@ fn default_alpha() -> u8 {
 #[serde(untagged)]
 enum InnerColor {
   /// Color hex string, for example: #fff, #ffffff, or #ffffffff.
-  String(String),
+  String(
+    #[cfg_attr(
+      feature = "schema",
+      schemars(pattern("^#?([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6}|[A-Fa-f0-9]{8})$"))
+    )]
+    String,
+  ),
   /// Array of RGB colors. Each value has minimum of 0 and maximum of 255.
   Rgb((u8, u8, u8)),
   /// Array of RGBA colors. Each value has minimum of 0 and maximum of 255.
@@ -1516,30 +1812,6 @@ impl<'de> Deserialize<'de> for Color {
     };
 
     Ok(color)
-  }
-}
-
-#[cfg(feature = "schema")]
-impl schemars::JsonSchema for Color {
-  fn schema_name() -> std::borrow::Cow<'static, str> {
-    "Color".into()
-  }
-
-  fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    let mut schema = schemars::schema_for!(InnerColor);
-    schema.remove("title"); // Remove `title: InnerColor` from schema
-
-    // Add hex color pattern validation to the first variant (string)
-    if let Some(serde_json::Value::Array(any_of)) = schema.get_mut("anyOf")
-      && let Some(str_schema) = any_of.first_mut().and_then(|v| v.as_object_mut())
-    {
-      str_schema.insert(
-        "pattern".to_string(),
-        "^#?([A-Fa-f0-9]{3}|[A-Fa-f0-9]{6}|[A-Fa-f0-9]{8})$".into(),
-      );
-    }
-
-    schema
   }
 }
 
@@ -1615,7 +1887,7 @@ pub enum ScrollBarStyle {
   /// Fluent UI style overlay scrollbars. **Windows Only**
   ///
   /// Requires WebView2 Runtime version 125.0.2535.41 or higher, does nothing on older versions,
-  /// see https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/?tabs=dotnetcsharp#10253541
+  /// see <https://learn.microsoft.com/en-us/microsoft-edge/webview2/release-notes/?tabs=dotnetcsharp#10253541>
   FluentOverlay,
 }
 
@@ -1638,7 +1910,7 @@ pub struct WindowConfig {
   /// ## Example:
   ///
   /// ```rust
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?.build()?;
   ///     Ok(())
@@ -1652,9 +1924,15 @@ pub struct WindowConfig {
   /// The user agent for the webview
   #[serde(alias = "user-agent")]
   pub user_agent: Option<String>,
-  /// Whether the drag and drop is enabled or not on the webview. By default it is enabled.
+  /// Whether the drag and drop handlers used internally to generate [`DragDropEvent`]s are enabled on the webview. By default it is enabled.
   ///
-  /// Disabling it is required to use HTML5 drag and drop on the frontend on Windows.
+  /// Disabling it is required to use HTML5 drag and drop on the frontend on Windows since we replace the drag drop handler of WebView2.
+  ///
+  /// Note: this setting maps to [`WebviewBuilder::disable_drag_drop_handler`], not [`WindowBuilder::drag_and_drop`].
+  ///
+  /// [`DragDropEvent`]: https://docs.rs/tauri/latest/tauri/enum.DragDropEvent.html
+  /// [`WebviewBuilder::disable_drag_drop_handler`]: https://docs.rs/tauri/latest/tauri/webview/struct.WebviewBuilder.html#method.disable_drag_drop_handler
+  /// [`WindowBuilder::drag_and_drop`]: https://docs.rs/tauri/latest/x86_64-pc-windows-msvc/tauri/window/struct.WindowBuilder.html#method.drag_and_drop
   #[serde(default = "default_true", alias = "drag-drop-enabled")]
   pub drag_drop_enabled: bool,
   /// Whether or not the window starts centered or not.
@@ -1733,6 +2011,8 @@ pub struct WindowConfig {
   ///
   /// Note that on `macOS` this requires the `macos-private-api` feature flag, enabled under `tauri > macOSPrivateApi`.
   /// WARNING: Using private APIs on `macOS` prevents your application from being accepted to the `App Store`.
+  ///
+  /// On Windows, using `noRedirectionBitmap` can help avoid a white flash when creating a transparent window.
   #[serde(default)]
   pub transparent: bool,
   /// Whether the window is maximized or not.
@@ -1765,6 +2045,12 @@ pub struct WindowConfig {
   pub skip_taskbar: bool,
   /// The name of the window class created on Windows to create the window. **Windows only**.
   pub window_classname: Option<String>,
+  /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
+  ///
+  /// This can avoid the white flash that may appear before the webview content is rendered
+  /// when using a transparent window. **Windows only**.
+  #[serde(default, alias = "no-redirection-bitmap")]
+  pub no_redirection_bitmap: bool,
   /// The initial window theme. Defaults to the system theme. Only implemented on Windows and macOS 10.14+.
   pub theme: Option<crate::Theme>,
   /// The style of the macOS title bar.
@@ -1789,8 +2075,14 @@ pub struct WindowConfig {
   /// [tabbing identifier]: <https://developer.apple.com/documentation/appkit/nswindow/1644704-tabbingidentifier>
   #[serde(default, alias = "tabbing-identifier")]
   pub tabbing_identifier: Option<String>,
-  /// Defines additional browser arguments on Windows. By default wry passes `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
-  /// so if you use this method, you also need to disable these components by yourself if you want.
+  /// Defines additional browser arguments on Windows.
+  ///
+  /// ## Warning
+  ///
+  /// Webview instances with different browser arguments must also have different [data directories](Self::data_directory).
+  ///
+  /// By default wry passes `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
+  /// so if you set this, you also need to disable these components by yourself if you want.
   #[serde(default, alias = "additional-browser-args")]
   pub additional_browser_args: Option<String>,
   /// Whether or not the window has shadow.
@@ -1907,7 +2199,7 @@ pub struct WindowConfig {
   /// - **iOS**: Supported since version 17.0+.
   /// - **macOS**: Supported since version 14.0+.
   ///
-  /// see https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578
+  /// see <https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578>
   #[serde(default, alias = "background-throttling")]
   pub background_throttling: Option<BackgroundThrottlingPolicy>,
   /// Whether we should disable JavaScript code execution on the webview or not.
@@ -1967,6 +2259,92 @@ pub struct WindowConfig {
   /// - **Linux / Android / iOS / macOS**: Unsupported. Only supports `Default` and performs no operation.
   #[serde(default, alias = "scroll-bar-style")]
   pub scroll_bar_style: ScrollBarStyle,
+
+  /// Whether to limit navigations to App-Bound Domains. This is necessary to
+  /// enable Service Workers on iOS according to
+  /// [StackOverflow](https://stackoverflow.com/questions/49673399/service-workers-unavailable-in-wkwebview-in-ios-11-3/64155509#64155509).
+  ///
+  /// Default is false.
+  ///
+  /// Note: If you set this to `true` make sure to add localhost and any [`registrable
+  /// domains`](https://developer.mozilla.org/en-US/docs/Glossary/Registrable_domain)
+  /// used in this webview to tauri-src/Info.ios.plist:
+  ///
+  /// ```xml
+  /// <plist>
+  /// <dict>
+  ///     <key>WKAppBoundDomains</key>
+  ///     <array>
+  ///         <string>localhost</string>
+  ///         <string>aregistrabledomain.example</string>
+  ///     </array>
+  /// </dict>
+  /// </plist>
+  /// ```
+  ///
+  /// You must add `localhost` if any webview with this set to true opens a
+  /// local webpage, makes any localhost calls, or uses the isolation pattern
+  /// because Tauri uses the `localhost` domain for hosting the application
+  /// webpage, the IPC protocol, and the isolation pattern's iframe.
+  ///
+  /// Requests served through custom uri schemes are allowed so long as they use
+  /// a registrable domain specified in the `WKAppBoundDomains` array for all the
+  /// requests from the app, including requests for the `localhost` domain.
+  ///
+  /// In theory, you can whitelist an entire uri scheme by including the
+  /// protocol name followed by a colon. For example, to allow all requests
+  /// using a custom "stream" uri scheme (see [this tauri
+  /// example](https://github.com/tauri-apps/tauri/blob/dev/examples/streaming/main.rs)),
+  /// you could add `stream:` to the AppBoundDomains array. That said, I'm not
+  /// sure whether Apple would let your app through app review if you do
+  /// whitelist an entire protocol because this feature is not mentioned in
+  /// [their blog post on App-Bound
+  /// Domains](https://webkit.org/blog/10882/app-bound-domains/).
+  ///
+  /// See https://webkit.org/blog/10882/app-bound-domains/ and
+  /// https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/limitsnavigationstoappbounddomains
+  /// for the official documentation on App-Bound Domains.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS**: Supported since version 14.0+.
+  /// - **Linux / Windows / Android / MacOS:** Unsupported.
+  #[serde(default, alias = "limit-navigations-to-app-bound-domains")]
+  pub limit_navigations_to_app_bound_domains: bool,
+  /// The name of the Android activity to create for this window.
+  #[serde(default, alias = "activity-name")]
+  pub activity_name: Option<String>,
+  /// The name of the Android activity that is creating this webview window.
+  ///
+  /// This is important to determine which stack the activity will belong to.
+  #[serde(default, alias = "created-by-activity-name")]
+  pub created_by_activity_name: Option<String>,
+
+  /// Sets the identifier of the scene that is requesting the new scene,
+  /// establishing a relationship between the two scenes.
+  ///
+  /// By default the system uses the foreground scene.
+  #[serde(default, alias = "requested-by-scene-identifier")]
+  pub requested_by_scene_identifier: Option<String>,
+  /// Controls the WebView's browser-level general autofill behavior.
+  ///
+  /// **This option does not disable password or credit card autofill.**
+  ///
+  /// When set to `false`, the WebView will not automatically populate
+  /// general form fields using previously stored data such as addresses
+  /// or contact information.
+  ///
+  /// If not specified, this is `true` by default.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows**: Supported. WebView2's autofill feature (called
+  ///   "Suggestions") may not honor `autocomplete="off"` on input
+  ///   elements in some cases.
+  /// - **Linux / Android / iOS / macOS**: Unsupported and performs no
+  ///   operation.
+  #[serde(default = "default_true", alias = "general-autofill-enabled")]
+  pub general_autofill_enabled: bool,
 }
 
 impl Default for WindowConfig {
@@ -2005,6 +2383,7 @@ impl Default for WindowConfig {
       content_protected: false,
       skip_taskbar: false,
       window_classname: None,
+      no_redirection_bitmap: false,
       theme: None,
       title_bar_style: Default::default(),
       traffic_light_position: None,
@@ -2029,6 +2408,11 @@ impl Default for WindowConfig {
       data_directory: None,
       data_store_identifier: None,
       scroll_bar_style: ScrollBarStyle::Default,
+      limit_navigations_to_app_bound_domains: false,
+      activity_name: None,
+      created_by_activity_name: None,
+      requested_by_scene_identifier: None,
+      general_autofill_enabled: true,
     }
   }
 }
@@ -2038,11 +2422,11 @@ fn default_window_label() -> String {
 }
 
 fn default_width() -> f64 {
-  800f64
+  800.
 }
 
 fn default_height() -> f64 {
-  600f64
+  600.
 }
 
 fn default_title() -> String {
@@ -2108,7 +2492,7 @@ impl CspDirectiveSources {
 
 /// A Content-Security-Policy definition.
 /// See <https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP>.
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum Csp {
@@ -2116,6 +2500,24 @@ pub enum Csp {
   Policy(String),
   /// An object mapping a directive with its sources values as a list of strings.
   DirectiveMap(HashMap<String, CspDirectiveSources>),
+}
+
+impl Serialize for Csp {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    match self {
+      Self::Policy(policy) => serializer.serialize_str(policy),
+      Self::DirectiveMap(map) => {
+        // Serialize through `BTreeMap` so the output is deterministic
+        // see: https://github.com/tauri-apps/tauri/issues/14978
+        // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+        let btree_map: BTreeMap<_, _> = map.iter().collect();
+        btree_map.serialize(serializer)
+      }
+    }
+  }
 }
 
 impl From<HashMap<String, CspDirectiveSources>> for Csp {
@@ -2271,7 +2673,7 @@ pub struct AssetProtocolConfig {
 /// definition of a header source
 ///
 /// The header value to a header name
-#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum HeaderSource {
@@ -2279,41 +2681,25 @@ pub enum HeaderSource {
   Inline(String),
   /// list version of the header value. Item are joined by "," for the real header value
   List(Vec<String>),
-  /// Header value with a pattern to match against the request path.
-  /// The pattern supports glob patterns (e.g., "*", "?", "**").
-  #[serde(rename_all = "camelCase")]
-  PatternValue {
-    /// The header value (can be any HeaderSource variant)
-    value: Box<HeaderSource>,
-    /// The glob pattern to match against the request path.
-    pattern: String,
-  },
-  /// (Rust struct | Json | JavaScript Object) equivalent of the header value. Items are composed from: key + space + value. Items are then joined by ";" for the real header value
+  /// (Rust struct | Json | JavaScript Object) equivalent of the header value. Items are composed from: key + space + value. Item are then joined by ";" for the real header value
   Map(HashMap<String, String>),
 }
 
-impl HeaderSource {
-  /// Check if this header source matches the given path pattern
-  pub fn matches_path(&self, path: &str) -> bool {
+impl Serialize for HeaderSource {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
     match self {
-      Self::PatternValue { pattern, .. } => {
-        println!("Matching path: {path} against pattern: {pattern}");
-
-        // Use glob pattern matching
-        glob::Pattern::new(pattern)
-          .map(|p| p.matches(path))
-          .unwrap_or(false)
+      Self::Inline(s) => serializer.serialize_str(s),
+      Self::List(l) => l.serialize(serializer),
+      Self::Map(m) => {
+        // Serialize through `BTreeMap` so the output is deterministic
+        // see: https://github.com/tauri-apps/tauri/issues/14978
+        // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+        let btree_map: BTreeMap<_, _> = m.iter().collect();
+        btree_map.serialize(serializer)
       }
-      // All other variants match all paths (treated as "*")
-      _ => true,
-    }
-  }
-
-  /// Get the actual header value, unwrapping PatternValue if needed
-  pub fn get_value(&self) -> &HeaderSource {
-    match self {
-      Self::PatternValue { value, .. } => value.get_value(),
-      other => other,
     }
   }
 }
@@ -2335,10 +2721,6 @@ impl Display for HeaderSource {
         }
         Ok(())
       }
-      Self::PatternValue { value, .. } => {
-        // Display the inner value
-        write!(f, "{}", value)
-      }
     }
   }
 }
@@ -2348,118 +2730,78 @@ impl Display for HeaderSource {
 /// Must add headers defined in the tauri configuration file to http responses
 pub trait HeaderAddition {
   /// adds all headers defined on the config file, given the current HeaderConfig
-  fn add_configured_headers(
-    self,
-    path: &str,
-    headers: Option<&HeaderConfig>,
-  ) -> http::response::Builder;
+  fn add_configured_headers(self, headers: Option<&HeaderConfig>) -> http::response::Builder;
 }
 
 impl HeaderAddition for http::response::Builder {
   /// Add the headers defined in the tauri configuration file to http responses
   ///
   /// this is a utility function, which is used in the same way as the `.header(..)` of the rust http library
-  fn add_configured_headers(
-    mut self,
-    path: &str,
-    headers: Option<&HeaderConfig>,
-  ) -> http::response::Builder {
+  fn add_configured_headers(mut self, headers: Option<&HeaderConfig>) -> http::response::Builder {
     if let Some(headers) = headers {
-      if let Some(value) = &headers.access_control_allow_credentials
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Access-Control-Allow-Credentials",
-          value.get_value().to_string(),
-        );
+      // Add the header Access-Control-Allow-Credentials, if we find a value for it
+      if let Some(value) = &headers.access_control_allow_credentials {
+        self = self.header("Access-Control-Allow-Credentials", value.to_string());
       };
 
-      if let Some(value) = &headers.access_control_allow_headers
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Access-Control-Allow-Headers",
-          value.get_value().to_string(),
-        );
+      // Add the header Access-Control-Allow-Headers, if we find a value for it
+      if let Some(value) = &headers.access_control_allow_headers {
+        self = self.header("Access-Control-Allow-Headers", value.to_string());
       };
 
-      if let Some(value) = &headers.access_control_allow_methods
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Access-Control-Allow-Methods",
-          value.get_value().to_string(),
-        );
+      // Add the header Access-Control-Allow-Methods, if we find a value for it
+      if let Some(value) = &headers.access_control_allow_methods {
+        self = self.header("Access-Control-Allow-Methods", value.to_string());
       };
 
-      if let Some(value) = &headers.access_control_expose_headers
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Access-Control-Expose-Headers",
-          value.get_value().to_string(),
-        );
+      // Add the header Access-Control-Expose-Headers, if we find a value for it
+      if let Some(value) = &headers.access_control_expose_headers {
+        self = self.header("Access-Control-Expose-Headers", value.to_string());
       };
 
-      if let Some(value) = &headers.access_control_max_age
-        && value.matches_path(path)
-      {
-        self = self.header("Access-Control-Max-Age", value.get_value().to_string());
+      // Add the header Access-Control-Max-Age, if we find a value for it
+      if let Some(value) = &headers.access_control_max_age {
+        self = self.header("Access-Control-Max-Age", value.to_string());
       };
 
-      if let Some(value) = &headers.cross_origin_embedder_policy
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Cross-Origin-Embedder-Policy",
-          value.get_value().to_string(),
-        );
+      // Add the header Cross-Origin-Embedder-Policy, if we find a value for it
+      if let Some(value) = &headers.cross_origin_embedder_policy {
+        self = self.header("Cross-Origin-Embedder-Policy", value.to_string());
       };
 
-      if let Some(value) = &headers.cross_origin_opener_policy
-        && value.matches_path(path)
-      {
-        self = self.header("Cross-Origin-Opener-Policy", value.get_value().to_string());
+      // Add the header Cross-Origin-Opener-Policy, if we find a value for it
+      if let Some(value) = &headers.cross_origin_opener_policy {
+        self = self.header("Cross-Origin-Opener-Policy", value.to_string());
       };
 
-      if let Some(value) = &headers.cross_origin_resource_policy
-        && value.matches_path(path)
-      {
-        self = self.header(
-          "Cross-Origin-Resource-Policy",
-          value.get_value().to_string(),
-        );
+      // Add the header Cross-Origin-Resource-Policy, if we find a value for it
+      if let Some(value) = &headers.cross_origin_resource_policy {
+        self = self.header("Cross-Origin-Resource-Policy", value.to_string());
       };
 
-      if let Some(value) = &headers.permissions_policy
-        && value.matches_path(path)
-      {
-        self = self.header("Permission-Policy", value.get_value().to_string());
+      // Add the header Permission-Policy, if we find a value for it
+      if let Some(value) = &headers.permissions_policy {
+        self = self.header("Permission-Policy", value.to_string());
       };
 
-      if let Some(value) = &headers.service_worker_allowed
-        && value.matches_path(path)
-      {
-        self = self.header("Service-Worker-Allowed", value.get_value().to_string());
+      if let Some(value) = &headers.service_worker_allowed {
+        self = self.header("Service-Worker-Allowed", value.to_string());
       }
 
-      if let Some(value) = &headers.timing_allow_origin
-        && value.matches_path(path)
-      {
-        self = self.header("Timing-Allow-Origin", value.get_value().to_string());
+      // Add the header Timing-Allow-Origin, if we find a value for it
+      if let Some(value) = &headers.timing_allow_origin {
+        self = self.header("Timing-Allow-Origin", value.to_string());
       };
 
-      if let Some(value) = &headers.x_content_type_options
-        && value.matches_path(path)
-      {
-        self = self.header("X-Content-Type-Options", value.get_value().to_string());
+      // Add the header X-Content-Type-Options, if we find a value for it
+      if let Some(value) = &headers.x_content_type_options {
+        self = self.header("X-Content-Type-Options", value.to_string());
       };
 
-      if let Some(value) = &headers.tauri_custom_header
-        && value.matches_path(path)
-      {
+      // Add the header Tauri-Custom-Header, if we find a value for it
+      if let Some(value) = &headers.tauri_custom_header {
         // Keep in mind to correctly set the Access-Control-Expose-Headers
-        self = self.header("Tauri-Custom-Header", value.get_value().to_string());
+        self = self.header("Tauri-Custom-Header", value.to_string());
       };
     }
     self
@@ -2474,9 +2816,9 @@ impl HeaderAddition for http::response::Builder {
 /// ## Example configuration
 /// ```javascript
 /// {
-///  //...
+///  //..
 ///   app:{
-///     //...
+///     //..
 ///     security: {
 ///       headers: {
 ///         "Cross-Origin-Opener-Policy": "same-origin",
@@ -2489,36 +2831,18 @@ impl HeaderAddition for http::response::Builder {
 ///         "Tauri-Custom-Header": {
 ///           "key1": "'value1' 'value2'",
 ///           "key2": "'value3'"
-///         },
-///         // Pattern-based header configuration
-///         "Service-Worker-Allowed": {
-///           "value": "/",
-///           "pattern": "/worker.js"  // Only set this header for requests to /worker.js
 ///         }
 ///       },
 ///       csp: "default-src 'self'; connect-src ipc: http://ipc.localhost",
 ///     }
-///     //...
+///     //..
 ///   }
-///  //...
+///  //..
 /// }
 /// ```
 /// In this example `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` are set to allow for the use of [`SharedArrayBuffer`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer).
 /// The result is, that those headers are then set on every response sent via the `get_response` function in crates/tauri/src/protocol/tauri.rs.
 /// The Content-Security-Policy header is defined separately, because it is also handled separately.
-///
-/// ## Pattern matching
-///
-/// Headers can be configured with patterns to only apply to specific request paths:
-/// - Use glob patterns like `*`, `?`, `**` for matching
-/// - Pattern matching is case-sensitive
-/// - If no pattern is specified, the header applies to all paths (equivalent to `"*"`)
-///
-/// Examples:
-/// - `"/worker.js"` - matches exactly `/worker.js`
-/// - `"/api/*"` - matches any path under `/api/`
-/// - `"*.js"` - matches any JavaScript file
-/// - `"**/*.json"` - matches any JSON file at any depth
 ///
 /// For the helloworld example, this config translates into those response headers:
 /// ```http
@@ -2533,9 +2857,8 @@ impl HeaderAddition for http::response::Builder {
 /// ```
 /// Since the resulting header values are always 'string-like'. So depending on the what data type the HeaderSource is, they need to be converted.
 ///  - `String`(JS/Rust): stay the same for the resulting header value
-///  - `Array`(JS)/`Vec<String>`(Rust): Item are joined by ", " for the resulting header value
-///  - `Object`(JS)/ `Hashmap<String, String>`(Rust): Items are composed from: key + space + value. Items are then joined by "; " for the resulting header value
-///  - `PatternValue`(JS Object with `value` and `pattern`): The `value` field can be any of the above types, and `pattern` is a glob pattern string
+///  - `Array`(JS)/`Vec\<String\>`(Rust): Item are joined by ", " for the resulting header value
+///  - `Object`(JS)/ `Hashmap\<String,String\>`(Rust): Items are composed from: key + space + value. Item are then joined by "; " for the resulting header value
 #[derive(Debug, Default, PartialEq, Eq, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -2825,7 +3148,7 @@ pub struct AppConfig {
   /// and use it like this
   ///
   /// ```rust
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?.build()?;
   ///     Ok(())
@@ -2903,13 +3226,18 @@ pub struct TrayIconConfig {
   /// A Boolean value that determines whether the image represents a [template](https://developer.apple.com/documentation/appkit/nsimage/1520017-template?language=objc) image on macOS.
   #[serde(default, alias = "icon-as-template")]
   pub icon_as_template: bool,
+  /// **No longer works since v2.2, use [`Self::show_menu_on_left_click`] instead**
+  ///
   /// A Boolean value that determines whether the menu should appear when the tray icon receives a left click.
   ///
   /// ## Platform-specific:
   ///
   /// - **Linux**: Unsupported.
   #[serde(default = "default_true", alias = "menu-on-left-click")]
-  #[deprecated(since = "2.2.0", note = "Use `show_menu_on_left_click` instead.")]
+  #[deprecated(
+    since = "2.2.0",
+    note = "No longer works, use `show_menu_on_left_click` instead."
+  )]
   pub menu_on_left_click: bool,
   /// A Boolean value that determines whether the menu should appear when the tray icon receives a left click.
   ///
@@ -2947,7 +3275,7 @@ pub struct IosConfig {
   /// Translates to the bundle's CFBundleVersion property.
   #[serde(alias = "bundle-version")]
   pub bundle_version: Option<String>,
-  /// A version string indicating the minimum iOS version that the bundled application supports. Defaults to `13.0`.
+  /// A version string indicating the minimum iOS version that the bundled application supports. Defaults to `15.0`.
   ///
   /// Maps to the IPHONEOS_DEPLOYMENT_TARGET value.
   #[serde(
@@ -3004,6 +3332,12 @@ pub struct AndroidConfig {
   /// Note that to use this feature, you should remove `/tauri.properties` from `src-tauri/gen/android/app/.gitignore` so the current versionCode is committed to the repository.
   #[serde(alias = "auto-increment-version-code", default)]
   pub auto_increment_version_code: bool,
+
+  /// Application ID suffix to append for debug builds.
+  /// This allows installing debug and release versions side-by-side on the same device.
+  /// Example: ".debug" will make debug builds use "com.example.app.debug" as the application ID.
+  #[serde(alias = "debug-application-id-suffix")]
+  pub debug_application_id_suffix: Option<String>,
 }
 
 impl Default for AndroidConfig {
@@ -3012,6 +3346,7 @@ impl Default for AndroidConfig {
       min_sdk_version: default_min_sdk_version(),
       version_code: None,
       auto_increment_version_code: false,
+      debug_application_id_suffix: None,
     }
   }
 }
@@ -3213,6 +3548,32 @@ pub struct BuildConfig {
   /// Additional paths to watch for changes when running `tauri dev`.
   #[serde(alias = "additional-watch-directories", default)]
   pub additional_watch_folders: Vec<PathBuf>,
+  /// Windows-specific build configuration.
+  #[serde(default)]
+  pub windows: WindowsBuildConfig,
+}
+
+/// Windows-specific build configuration.
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WindowsBuildConfig {
+  /// Whether to statically link the Visual C++ runtime into the application binary on Windows MSVC targets.
+  #[serde(
+    default = "default_true",
+    rename = "staticVCRuntime",
+    alias = "static-vc-runtime",
+    alias = "staticVcRuntime"
+  )]
+  pub static_vc_runtime: bool,
+}
+
+impl Default for WindowsBuildConfig {
+  fn default() -> Self {
+    Self {
+      static_vc_runtime: true,
+    }
+  }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3354,6 +3715,22 @@ pub struct Config {
   #[serde(rename = "$schema")]
   pub schema: Option<String>,
   /// App name.
+  ///
+  /// This is the name your app is known by on the user's system, so it must be changed from the
+  /// default before publishing. Besides naming the generated bundles, it is written into platform
+  /// metadata and install paths that are expected to be unique to your application.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **macOS**: Names the `.app` bundle and the `.dmg`, and sets the bundle's
+  ///    `CFBundleDisplayName` and `CFBundleName` properties. `CFBundleName` can be overridden with
+  ///    [`bundle > macOS > bundleName`](MacConfig::bundle_name).
+  /// - **Linux**: Kebab-cased for the Debian and RPM package names, used as the `Name` entry of
+  ///    the desktop file and as the resource directory name under `/usr/lib`.
+  /// - **Windows**: Names the installers, the installation directory, the Start Menu folder and
+  ///    the `HKCU\Software\<publisher>\<product name>` registry key. It also derives the default
+  ///    WiX upgrade code, which must be unique across applications and can be set explicitly with
+  ///    [`bundle > windows > wix > upgradeCode`](WixConfig::upgrade_code).
   #[serde(alias = "product-name")]
   #[cfg_attr(feature = "schema", schemars(regex(pattern = "^[^/\\:*?\"<>|]+$")))]
   pub product_name: Option<String>,
@@ -3394,6 +3771,8 @@ pub struct Config {
   /// the bundle ID and path to the webview data directory.
   /// This string must contain only alphanumeric characters (A-Z, a-z, and 0-9), hyphens (-),
   /// and periods (.).
+  /// The default value `com.tauri.dev` is rejected by `tauri build` and must be changed before
+  /// building your application.
   pub identifier: String,
   /// The App configuration.
   #[serde(default)]
@@ -3412,16 +3791,29 @@ pub struct Config {
 /// The plugin configs holds a HashMap mapping a plugin name to its configuration object.
 ///
 /// See more: <https://v2.tauri.app/reference/config/#pluginconfig>
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub struct PluginConfig(pub HashMap<String, JsonValue>);
+
+impl Serialize for PluginConfig {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    // Serialize through `BTreeMap` so the output is deterministic
+    // see: https://github.com/tauri-apps/tauri/issues/14978
+    // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+    let btree_map: BTreeMap<_, _> = self.0.iter().collect();
+    btree_map.serialize(serializer)
+  }
+}
 
 /// Implement `ToTokens` for all config structs, allowing a literal `Config` to be built.
 ///
 /// This allows for a build script to output the values in a `Config` to a `TokenStream`, which can
 /// then be consumed by another crate. Useful for passing a config to both the build script and the
 /// application using tauri while only parsing it once (in the build script).
-#[cfg(feature = "build")]
+#[cfg(any(feature = "build", feature = "build-2"))]
 mod build {
   use super::*;
   use crate::{literal_struct, tokens::*};
@@ -3638,6 +4030,7 @@ mod build {
       let content_protected = self.content_protected;
       let skip_taskbar = self.skip_taskbar;
       let window_classname = opt_str_lit(self.window_classname.as_ref());
+      let no_redirection_bitmap = self.no_redirection_bitmap;
       let theme = opt_lit(self.theme.as_ref());
       let title_bar_style = &self.title_bar_style;
       let traffic_light_position = opt_lit(self.traffic_light_position.as_ref());
@@ -3661,6 +4054,11 @@ mod build {
       let data_directory = opt_lit(self.data_directory.as_ref().map(path_buf_lit).as_ref());
       let data_store_identifier = opt_vec_lit(self.data_store_identifier, identity);
       let scroll_bar_style = &self.scroll_bar_style;
+      let limit_navigations_to_app_bound_domains = self.limit_navigations_to_app_bound_domains;
+      let activity_name = opt_lit(self.activity_name.as_ref());
+      let created_by_activity_name = opt_lit(self.created_by_activity_name.as_ref());
+      let requested_by_scene_identifier = opt_lit(self.requested_by_scene_identifier.as_ref());
+      let general_autofill_enabled = self.general_autofill_enabled;
 
       literal_struct!(
         tokens,
@@ -3699,6 +4097,7 @@ mod build {
         content_protected,
         skip_taskbar,
         window_classname,
+        no_redirection_bitmap,
         theme,
         title_bar_style,
         traffic_light_position,
@@ -3721,7 +4120,12 @@ mod build {
         disable_input_accessory_view,
         data_directory,
         data_store_identifier,
-        scroll_bar_style
+        scroll_bar_style,
+        limit_navigations_to_app_bound_domains,
+        activity_name,
+        created_by_activity_name,
+        requested_by_scene_identifier,
+        general_autofill_enabled
       );
     }
   }
@@ -3776,6 +4180,28 @@ mod build {
     }
   }
 
+  impl ToTokens for BundleResources {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let prefix = quote! { ::tauri::utils::config::BundleResources };
+
+      tokens.append_all(match self {
+        Self::List(paths) => {
+          let paths = vec_lit(paths, str_lit);
+          quote! { #prefix::List(#paths) }
+        }
+        Self::Map(map) => {
+          let map = map_lit(
+            quote! { ::std::collections::HashMap },
+            map,
+            str_lit,
+            str_lit,
+          );
+          quote! { #prefix::Map(#map) }
+        }
+      })
+    }
+  }
+
   impl ToTokens for BundleConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
       let publisher = quote!(None);
@@ -3784,7 +4210,7 @@ mod build {
       let active = self.active;
       let targets = quote!(Default::default());
       let create_updater_artifacts = quote!(Default::default());
-      let resources = quote!(None);
+      let resources = opt_lit(self.resources.as_ref());
       let copyright = quote!(None);
       let category = quote!(None);
       let file_associations = quote!(None);
@@ -3799,6 +4225,7 @@ mod build {
       let macos = quote!(Default::default());
       let ios = quote!(Default::default());
       let android = quote!(Default::default());
+      let cef = quote!(Default::default());
 
       literal_struct!(
         tokens,
@@ -3823,7 +4250,8 @@ mod build {
         linux,
         macos,
         ios,
-        android
+        android,
+        cef
       );
     }
   }
@@ -3883,6 +4311,7 @@ mod build {
       let features = quote!(None);
       let remove_unused_commands = quote!(false);
       let additional_watch_folders = quote!(Vec::new());
+      let windows = &self.windows;
 
       literal_struct!(
         tokens,
@@ -3895,7 +4324,20 @@ mod build {
         before_bundle_command,
         features,
         remove_unused_commands,
-        additional_watch_folders
+        additional_watch_folders,
+        windows
+      );
+    }
+  }
+
+  impl ToTokens for WindowsBuildConfig {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+      let static_vc_runtime = self.static_vc_runtime;
+
+      literal_struct!(
+        tokens,
+        ::tauri::utils::config::WindowsBuildConfig,
+        static_vc_runtime
       );
     }
   }
@@ -3927,9 +4369,14 @@ mod build {
           quote!(#prefix::Policy(#policy.into()))
         }
         Self::DirectiveMap(list) => {
+          // Pass a sorted vec so the HashMap constructor is deterministic
+          // see: https://github.com/tauri-apps/tauri/issues/14978
+          // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+          let mut sorted: Vec<_> = list.iter().collect();
+          sorted.sort_by_key(|(k, _)| *k);
           let map = map_lit(
             quote! { ::std::collections::HashMap },
-            list,
+            sorted,
             str_lit,
             identity,
           );
@@ -3985,16 +4432,18 @@ mod build {
           quote!(#prefix::List(#list))
         }
         Self::Map(m) => {
-          let map = map_lit(quote! { ::std::collections::HashMap }, m, str_lit, str_lit);
+          // Pass a sorted vec so the HashMap constructor is deterministic
+          // see: https://github.com/tauri-apps/tauri/issues/14978
+          // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+          let mut sorted: Vec<_> = m.iter().collect();
+          sorted.sort_by_key(|(k, _)| *k);
+          let map = map_lit(
+            quote! { ::std::collections::HashMap },
+            sorted,
+            str_lit,
+            str_lit,
+          );
           quote!(#prefix::Map(#map))
-        }
-        Self::PatternValue { value, pattern } => {
-          let value_tokens = quote! { #value };
-          let pattern_str = pattern.as_str();
-          quote!(#prefix::PatternValue {
-            value: ::std::boxed::Box::new(#value_tokens),
-            pattern: #pattern_str.into()
-          })
         }
       })
     }
@@ -4140,9 +4589,14 @@ mod build {
 
   impl ToTokens for PluginConfig {
     fn to_tokens(&self, tokens: &mut TokenStream) {
+      // Pass a sorted vec so the HashMap constructor is deterministic
+      // see: https://github.com/tauri-apps/tauri/issues/14978
+      // TODO: Remove this in v3, use a BTreeMap instead of a HashMap
+      let mut sorted: Vec<_> = self.0.iter().collect();
+      sorted.sort_by_key(|(k, _)| *k);
       let config = map_lit(
         quote! { ::std::collections::HashMap },
-        &self.0,
+        sorted,
         str_lit,
         json_value_lit,
       );
@@ -4227,6 +4681,7 @@ mod test {
       features: None,
       remove_unused_commands: false,
       additional_watch_folders: Vec::new(),
+      windows: WindowsBuildConfig::default(),
     };
 
     // create a bundle config
@@ -4252,6 +4707,7 @@ mod test {
       windows: Default::default(),
       ios: Default::default(),
       android: Default::default(),
+      cef: Default::default(),
     };
 
     // test the configs

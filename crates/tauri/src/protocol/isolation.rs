@@ -26,7 +26,7 @@ pub fn get<R: Runtime>(
   window_origin: String,
   use_https_scheme: bool,
 ) -> UriSchemeProtocolHandler {
-  let frame_src = R::custom_scheme_url(schema, use_https_scheme);
+  let frame_src = manager.custom_scheme_url(schema, use_https_scheme);
 
   let assets = assets as Arc<dyn Assets<R>>;
 
@@ -51,7 +51,7 @@ pub fn get<R: Runtime>(
           };
           match template.render(asset.as_ref(), &Default::default()) {
             Ok(asset) => http::Response::builder()
-              .add_configured_headers("/index.html", manager.config.app.security.headers.as_ref())
+              .add_configured_headers(manager.config.app.security.headers.as_ref())
               .header(CONTENT_TYPE, mime::TEXT_HTML.as_ref())
               .header("Content-Security-Policy", csp)
               .body(asset.into_string().into_bytes()),

@@ -17,16 +17,11 @@ pub use webview_window::{WebviewWindow, WebviewWindowBuilder};
 pub use cookie;
 use http::HeaderMap;
 use serde::Serialize;
-use tauri_macros::default_runtime;
 
-#[cfg(feature = "cef")]
-pub use tauri_runtime_cef::NewWindowOpener as CefWindowOpener;
-#[cfg(feature = "wry")]
-pub use tauri_runtime_wry::NewWindowOpener as WryWindowOpener;
-
-#[cfg(feature = "cef")]
-use crate::CefDevToolsProtocol;
-pub use tauri_runtime::webview::{NewWindowFeatures, PageLoadEvent, ScrollBarStyle};
+pub use tauri_runtime::webview::{
+  NewWindowFeatures, PageLoadEvent, PermissionKind, PermissionResponse, ScrollBarStyle,
+  WebContentProcessTermination, WebContentProcessTerminationReason,
+};
 // Remove this re-export in v3
 pub use tauri_runtime::Cookie;
 use tauri_runtime::{
@@ -73,12 +68,21 @@ pub(crate) type UriSchemeProtocolHandler =
   Box<dyn Fn(&str, http::Request<Vec<u8>>, UriSchemeResponder) + Send + Sync>;
 pub(crate) type OnPageLoad<R> = dyn Fn(Webview<R>, PageLoadPayload<'_>) + Send + Sync + 'static;
 pub(crate) type OnDocumentTitleChanged<R> = dyn Fn(Webview<R>, String) + Send + 'static;
-pub(crate) type OnAddressChanged<R> = dyn Fn(Webview<R>, &Url) + Send + Sync + 'static;
 pub(crate) type DownloadHandler<R> = dyn Fn(Webview<R>, DownloadEvent<'_>) -> bool + Send + Sync;
+pub(crate) type PermissionRequestHandler<R> =
+  dyn Fn(Webview<R>, PermissionKind) -> PermissionResponse + Send + Sync + 'static;
 
 #[derive(Clone, Serialize)]
 pub(crate) struct CreatedEvent {
   pub(crate) label: String,
+}
+
+fn is_url_for_custom_protocol(current_url: &Url, protocol: &str, protocol_url: &Url) -> bool {
+  if protocol_url.scheme() == protocol {
+    current_url.scheme() == protocol
+  } else {
+    current_url.scheme() == protocol_url.scheme() && current_url.domain() == protocol_url.domain()
+  }
 }
 
 /// Download event for the [`WebviewBuilder#method.on_download`] hook.
@@ -156,93 +160,42 @@ pub struct InvokeRequest {
   pub invoke_key: String,
 }
 
-/// The platform webview handle. Accessed with [`Webview#method.with_webview`];
-#[cfg(feature = "wry")]
-#[cfg_attr(docsrs, doc(cfg(feature = "wry")))]
-pub struct PlatformWebview(tauri_runtime_wry::Webview);
+/// The platform webview handle. Accessed with [`Webview#method.with_webview`].
+///
+/// This dereferences to the webview type defined by the runtime
+/// (e.g. `tauri_runtime_wry::Webview` for the wry runtime or
+/// `tauri_runtime_cef::Webview` for the CEF runtime), which exposes the
+/// platform webview APIs.
+///
+/// With the type-erased [`DynRuntime`](crate::DynRuntime) the target is
+/// [`DynWebview`](tauri_runtime::dynamic::DynWebview); use [`PlatformWebview::downcast_ref`]
+/// to reach the runtime's webview type regardless of the runtime generic in use.
+pub struct PlatformWebview<R: Runtime = crate::DynRuntime>(R::Webview);
 
-#[cfg(feature = "wry")]
-impl PlatformWebview {
-  /// Returns [`webkit2gtk::WebView`] handle.
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-  ))]
-  #[cfg_attr(
-    docsrs,
-    doc(cfg(any(
-      target_os = "linux",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "netbsd",
-      target_os = "openbsd"
-    )))
-  )]
-  pub fn inner(&self) -> webkit2gtk::WebView {
-    self.0.clone()
+impl<R: Runtime> std::ops::Deref for PlatformWebview<R> {
+  type Target = R::Webview;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
   }
+}
 
-  /// Returns the WebView2 controller.
-  #[cfg(all(windows, feature = "wry"))]
-  #[cfg_attr(docsrs, doc(cfg(windows)))]
-  pub fn controller(
-    &self,
-  ) -> webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller {
-    self.0.controller.clone()
-  }
-
-  /// Returns the WebView2 environment.
-  #[cfg(all(windows, feature = "wry"))]
-  #[cfg_attr(docsrs, doc(cfg(windows)))]
-  pub fn environment(
-    &self,
-  ) -> webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment {
-    self.0.environment.clone()
-  }
-
-  /// Returns the [WKWebView] handle.
-  ///
-  /// [WKWebView]: https://developer.apple.com/documentation/webkit/wkwebview
-  #[cfg(any(target_os = "macos", target_os = "ios"))]
-  #[cfg_attr(docsrs, doc(cfg(any(target_os = "macos", target_os = "ios"))))]
-  pub fn inner(&self) -> *mut std::ffi::c_void {
-    self.0.webview
-  }
-
-  /// Returns WKWebView [controller] handle.
-  ///
-  /// [controller]: https://developer.apple.com/documentation/webkit/wkusercontentcontroller
-  #[cfg(any(target_os = "macos", target_os = "ios"))]
-  #[cfg_attr(docsrs, doc(cfg(any(target_os = "macos", target_os = "ios"))))]
-  pub fn controller(&self) -> *mut std::ffi::c_void {
-    self.0.manager
-  }
-
-  /// Returns [NSWindow] associated with the WKWebView webview.
-  ///
-  /// [NSWindow]: https://developer.apple.com/documentation/appkit/nswindow
-  #[cfg(target_os = "macos")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
-  pub fn ns_window(&self) -> *mut std::ffi::c_void {
-    self.0.ns_window
-  }
-
-  /// Returns [UIViewController] used by the WKWebView webview NSWindow.
-  ///
-  /// [UIViewController]: https://developer.apple.com/documentation/uikit/uiviewcontroller
-  #[cfg(target_os = "ios")]
-  #[cfg_attr(docsrs, doc(cfg(target_os = "ios")))]
-  pub fn view_controller(&self) -> *mut std::ffi::c_void {
-    self.0.view_controller
-  }
-
-  /// Returns handle for JNI execution.
-  #[cfg(target_os = "android")]
-  pub fn jni_handle(&self) -> tauri_runtime_wry::wry::JniHandle {
+impl<R: Runtime> PlatformWebview<R> {
+  /// Returns the inner runtime webview handle.
+  pub fn into_inner(self) -> R::Webview {
     self.0
+  }
+
+  /// Returns a reference to the runtime's webview type, if the runtime in use matches.
+  ///
+  /// Works both when `R` is the concrete runtime type and when it is the type-erased
+  /// [`DynRuntime`](crate::DynRuntime).
+  pub fn downcast_ref<W: std::any::Any>(&self) -> Option<&W> {
+    let inner: &dyn std::any::Any = &self.0;
+    match inner.downcast_ref::<tauri_runtime::dynamic::DynWebview>() {
+      Some(erased) => erased.downcast_ref::<W>(),
+      None => inner.downcast_ref::<W>(),
+    }
   }
 }
 
@@ -254,9 +207,12 @@ pub enum NewWindowResponse<R: Runtime> {
   ///
   /// ## Platform-specific:
   ///
-  /// **Linux**: The webview must be related to the caller webview. See [`WebviewBuilder::related_view`].
-  /// **Windows**: The webview must use the same environment as the caller webview. See [`WebviewBuilder::environment`].
-  /// **macOS**: The webview must use the same webview configuration as the caller webview. See [`WebviewBuilder::with_webview_configuration`] and [`NewWindowFeatures::webview_configuration`].
+  /// With the wry runtime the new webview must be linked to the caller webview using
+  /// [`NewWindowFeatures::into_opener`] or the `tauri_runtime_wry::WebviewWindowBuilderWryExt` extension trait:
+  ///
+  /// **Linux**: The webview must be related to the caller webview (`with_related_view`).
+  /// **Windows**: The webview must use the same environment as the caller webview (`with_environment`).
+  /// **macOS**: The webview must use the same webview configuration as the caller webview (`with_webview_configuration`).
   Create {
     /// Window that was created.
     window: crate::WebviewWindow<R>,
@@ -283,30 +239,16 @@ unstable_struct!(
     pub(crate) label: String,
     pub(crate) webview_attributes: WebviewAttributes,
     pub(crate) opener: Option<R::WindowOpener>,
-    pub(crate) platform_specific_attributes: Vec<R::PlatformSpecificWebviewAttribute>,
+    pub(crate) runtime_specific_attributes: R::RuntimeWebviewAttributes,
     pub(crate) web_resource_request_handler: Option<Box<WebResourceRequestHandler>>,
     pub(crate) navigation_handler: Option<Box<NavigationHandler>>,
     pub(crate) new_window_handler: Option<Box<NewWindowHandler<R>>>,
     pub(crate) on_page_load_handler: Option<Box<OnPageLoad<R>>>,
     pub(crate) document_title_changed_handler: Option<Box<OnDocumentTitleChanged<R>>>,
-    pub(crate) address_changed_handler: Option<Box<OnAddressChanged<R>>>,
     pub(crate) download_handler: Option<Arc<DownloadHandler<R>>>,
+    pub(crate) permission_request_handler: Option<Box<PermissionRequestHandler<R>>>,
   }
 );
-
-#[cfg(feature = "cef")]
-#[cfg_attr(not(feature = "unstable"), allow(dead_code))]
-impl WebviewBuilder<crate::Cef> {
-  /// Sets the browser runtime style.
-  ///
-  /// See [`tauri_runtime_cef::RuntimeStyle`] for more information.
-  pub fn browser_runtime_style(mut self, style: tauri_runtime_cef::RuntimeStyle) -> Self {
-    self
-      .platform_specific_attributes
-      .push(tauri_runtime_cef::WebviewAtribute::RuntimeStyle { style });
-    self
-  }
-}
 
 #[cfg_attr(not(feature = "unstable"), allow(dead_code))]
 impl<R: Runtime> WebviewBuilder<R> {
@@ -325,7 +267,7 @@ impl<R: Runtime> WebviewBuilder<R> {
     feature = "unstable",
     doc = r####"
 ```
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
     let webview_builder = tauri::webview::WebviewBuilder::new("label", tauri::WebviewUrl::App("index.html".into()));
@@ -342,7 +284,7 @@ tauri::Builder::<tauri::Wry>::new()
     feature = "unstable",
     doc = r####"
 ```
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let handle = app.handle().clone();
     std::thread::spawn(move || {
@@ -378,14 +320,14 @@ async fn create_window(app: tauri::AppHandle) {
       label: label.into(),
       webview_attributes: WebviewAttributes::new(url),
       opener: None,
-      platform_specific_attributes: Vec::new(),
+      runtime_specific_attributes: Default::default(),
       web_resource_request_handler: None,
       navigation_handler: None,
       new_window_handler: None,
       on_page_load_handler: None,
       document_title_changed_handler: None,
-      address_changed_handler: None,
       download_handler: None,
+      permission_request_handler: None,
     }
   }
 
@@ -460,14 +402,14 @@ async fn create_window(app: tauri::AppHandle) {
       label: config.label.clone(),
       webview_attributes: WebviewAttributes::from(&config),
       opener: None,
-      platform_specific_attributes: Vec::new(),
+      runtime_specific_attributes: Default::default(),
       web_resource_request_handler: None,
       navigation_handler: None,
       new_window_handler: None,
       on_page_load_handler: None,
       document_title_changed_handler: None,
-      address_changed_handler: None,
       download_handler: None,
+      permission_request_handler: None,
     }
   }
 
@@ -491,7 +433,7 @@ use tauri::{
 };
 use http::header::HeaderValue;
 use std::collections::HashMap;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
 
@@ -543,7 +485,7 @@ use tauri::{
 };
 use http::header::HeaderValue;
 use std::collections::HashMap;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
 
@@ -564,15 +506,6 @@ tauri::Builder::<tauri::Wry>::new()
     self
   }
 
-  /// Register a callback to be invoked when the webview's address (URL) changes.
-  pub fn on_address_change<F: Fn(Webview<R>, &Url) + Send + Sync + 'static>(
-    mut self,
-    f: F,
-  ) -> Self {
-    self.address_changed_handler.replace(Box::new(f));
-    self
-  }
-
   /// Set a new window request handler to decide if incoming url is allowed to be opened.
   ///
   /// A new window is requested to be opened by the [window.open] API.
@@ -590,7 +523,7 @@ use tauri::{
 };
 use http::header::HeaderValue;
 use std::collections::HashMap;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
 
@@ -623,7 +556,6 @@ tauri::Builder::<tauri::Wry>::new()
   /// # Platform-specific
   ///
   /// - **Android / iOS**: Not supported.
-  /// - **Windows**: The closure is executed on a separate thread to prevent a deadlock.
   ///
   /// [window.open]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
   pub fn on_new_window<
@@ -667,7 +599,7 @@ use tauri::{
   webview::{DownloadEvent, WebviewBuilder},
 };
 
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = WindowBuilder::new(app, "label").build()?;
     let webview_builder = WebviewBuilder::new("core", WebviewUrl::App("index.html".into()))
@@ -717,7 +649,7 @@ use tauri::{
 };
 use http::header::HeaderValue;
 use std::collections::HashMap;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
     let webview_builder = WebviewBuilder::new("core", WebviewUrl::App("index.html".into()))
@@ -745,6 +677,57 @@ tauri::Builder::<tauri::Wry>::new()
     self
   }
 
+  /// Defines a closure to be executed when a permission is requested.
+  ///
+  /// The handler receives the [`PermissionKind`] and should return
+  /// the desired [`PermissionResponse`].
+  ///
+  /// This is called before [`crate::Builder::on_permission_request`],
+  /// and skips it if the returned response is not [`crate::webview::PermissionResponse::Default`].
+  ///
+  /// > [!NOTE]
+  /// > This handler only triggers for new permission requests. If the user has already
+  /// > allowed or denied a permission persistently within the webview, the browser
+  /// > will use the saved preference instead of calling this handler.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **Windows**: Fully supported via WebView2's PermissionRequested event.
+  /// - **macOS / iOS**: Fully supported via WKUIDelegate's requestMediaCapturePermission.
+  /// - **Linux**: Fully supported via WebKitGTK's permission-request signal.
+  /// - **Android**: Supported via JNI bridge for geolocation, microphone, camera,
+  ///   protected media, and MIDI requests. Android runtime permissions may still
+  ///   trigger native OS prompts before access is granted.
+  ///
+  /// # Examples
+  ///
+  /// ```rust,no_run
+  /// use tauri::webview::{WebviewBuilder, PermissionKind, PermissionResponse};
+  /// tauri::Builder::default()
+  ///   .setup(|app| {
+  ///     let window = tauri::window::WindowBuilder::new(app, "label").build()?;
+  ///     let webview_builder = WebviewBuilder::new("core", tauri::WebviewUrl::App("index.html".into()))
+  ///       .on_permission_request(|webview, kind| {
+  ///         match kind {
+  ///           PermissionKind::Geolocation => PermissionResponse::Allow,
+  ///           PermissionKind::Notifications => PermissionResponse::Allow,
+  ///           _ => PermissionResponse::Default,
+  ///         }
+  ///       });
+  ///     let webview = window.add_child(webview_builder, tauri::LogicalPosition::new(0, 0), window.inner_size().unwrap())?;
+  ///     Ok(())
+  ///   });
+  /// ```
+  pub fn on_permission_request<
+    F: Fn(Webview<R>, PermissionKind) -> PermissionResponse + Send + Sync + 'static,
+  >(
+    mut self,
+    f: F,
+  ) -> Self {
+    self.permission_request_handler.replace(Box::new(f));
+    self
+  }
+
   /// Set information about the opener of the window.
   ///
   /// Must be when creating a new window on the [`WebviewBuilder::on_new_window`] handler.
@@ -760,7 +743,7 @@ tauri::Builder::<tauri::Wry>::new()
   ) -> crate::Result<PendingWebview<EventLoopMessage, R>> {
     let mut pending = PendingWebview::new(
       self.webview_attributes,
-      self.platform_specific_attributes,
+      self.runtime_specific_attributes,
       self.label.clone(),
     )?;
     pending.opener = self.opener.take();
@@ -807,18 +790,6 @@ tauri::Builder::<tauri::Wry>::new()
         }));
     }
 
-    if let Some(address_changed_handler) = self.address_changed_handler.take() {
-      let label = pending.label.clone();
-      let manager = manager.manager_owned();
-      pending
-        .address_changed_handler
-        .replace(Box::new(move |url| {
-          if let Some(w) = manager.get_webview(&label) {
-            address_changed_handler(w, url);
-          }
-        }));
-    }
-
     pending.web_resource_request_handler = self.web_resource_request_handler.take();
 
     if let Some(download_handler) = self.download_handler.take() {
@@ -855,6 +826,18 @@ tauri::Builder::<tauri::Wry>::new()
         }
       }));
 
+    let label_ = pending.label.clone();
+    let manager_ = manager.manager_owned();
+    if let Some(handler) = self.permission_request_handler {
+      pending.permission_request_handler = Some(Box::new(move |kind| {
+        if let Some(w) = manager_.get_webview(&label_) {
+          handler(w, kind)
+        } else {
+          PermissionResponse::Default
+        }
+      }));
+    }
+
     manager
       .manager()
       .webview
@@ -876,6 +859,7 @@ tauri::Builder::<tauri::Wry>::new()
     pending.webview_attributes.bounds = Some(tauri_runtime::dpi::Rect { size, position });
 
     let use_https_scheme = pending.webview_attributes.use_https_scheme;
+    let devtools = pending.webview_attributes.devtools;
 
     let webview = match &mut window.runtime() {
       RuntimeOrDispatch::Dispatch(dispatcher) => dispatcher.create_webview(pending),
@@ -884,7 +868,7 @@ tauri::Builder::<tauri::Wry>::new()
     .map(|webview| {
       app_manager
         .webview
-        .attach_webview(window.clone(), webview, use_https_scheme)
+        .attach_webview(window.clone(), webview, use_https_scheme, devtools)
     })?;
 
     Ok(webview)
@@ -933,7 +917,7 @@ const INIT_SCRIPT: &str = r#"
 "#;
 
 fn main() {
-  tauri::Builder::<tauri::Wry>::new()
+  tauri::Builder::default()
     .setup(|app| {
       let window = tauri::window::WindowBuilder::new(app, "label").build()?;
       let webview_builder = tauri::webview::WebviewBuilder::new("label", tauri::WebviewUrl::App("index.html".into()))
@@ -992,7 +976,7 @@ const INIT_SCRIPT: &str = r#"
 "#;
 
 fn main() {
-  tauri::Builder::<tauri::Wry>::new()
+  tauri::Builder::default()
     .setup(|app| {
       let window = tauri::window::WindowBuilder::new(app, "label").build()?;
       let webview_builder = tauri::webview::WebviewBuilder::new("label", tauri::WebviewUrl::App("index.html".into()))
@@ -1034,6 +1018,8 @@ fn main() {
   ///
   /// ## Warning
   ///
+  /// Webview instances with different browser arguments must also have different [data directories](Self::data_directory).
+  ///
   /// By default wry passes `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`
   /// so if you use this method, you also need to disable these components by yourself if you want.
   #[must_use]
@@ -1052,7 +1038,9 @@ fn main() {
     self
   }
 
-  /// Disables the drag and drop handler. This is required to use HTML5 drag and drop APIs on the frontend on Windows.
+  /// Disables the drag and drop handler used internally to generate [`DragDropEvent`](crate::DragDropEvent)s.
+  ///
+  /// This is required to use HTML5 drag and drop APIs on the frontend on Windows since we replace the drag drop handler of WebView2.
   #[must_use]
   pub fn disable_drag_drop_handler(mut self) -> Self {
     self.webview_attributes.drag_drop_handler_enabled = false;
@@ -1230,7 +1218,7 @@ fn main() {
   /// - **iOS**: Supported since version 17.0+.
   /// - **macOS**: Supported since version 14.0+.
   ///
-  /// see https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578
+  /// see <https://github.com/tauri-apps/tauri/issues/5250#issuecomment-2569380578>
   #[must_use]
   pub fn background_throttling(mut self, policy: BackgroundThrottlingPolicy) -> Self {
     self.webview_attributes.background_throttling = Some(policy);
@@ -1263,6 +1251,29 @@ fn main() {
     self
   }
 
+  /// Controls the WebView's browser-level general autofill behavior.
+  ///
+  /// **This option does not disable password or credit card autofill.**
+  ///
+  /// When set to `false`, the WebView will not automatically populate
+  /// general form fields using previously stored data such as addresses
+  /// or contact information.
+  ///
+  /// By default, this is `true`.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **Windows**: Supported. WebView2's autofill feature (called
+  ///   "Suggestions") may not honor `autocomplete="off"` on input
+  ///   elements in some cases.
+  /// - **Linux / Android / iOS / macOS**: Unsupported and performs no
+  ///   operation.
+  #[must_use]
+  pub fn general_autofill_enabled(mut self, enabled: bool) -> Self {
+    self.webview_attributes = self.webview_attributes.general_autofill_enabled(enabled);
+    self
+  }
+
   /// Whether to show a link preview when long pressing on links. Available on macOS and iOS only.
   ///
   /// Default is true.
@@ -1278,6 +1289,62 @@ fn main() {
     self.webview_attributes = self
       .webview_attributes
       .allow_link_preview(allow_link_preview);
+    self
+  }
+  /// Whether to limit navigations to App-Bound Domains. This is necessary to
+  /// enable Service Workers on iOS according to
+  /// [StackOverflow](https://stackoverflow.com/questions/49673399/service-workers-unavailable-in-wkwebview-in-ios-11-3/64155509#64155509).
+  ///
+  /// Default is false.
+  ///
+  /// Note: If you pass in `true` make sure to add localhost and any [`registrable
+  /// domains`](https://developer.mozilla.org/en-US/docs/Glossary/Registrable_domain)
+  /// used in this webview to tauri-src/Info.ios.plist:
+  ///
+  /// ```xml
+  /// <plist>
+  /// <dict>
+  ///     <key>WKAppBoundDomains</key>
+  ///     <array>
+  ///         <string>localhost</string>
+  ///         <string>aregistrabledomain.example</string>
+  ///     </array>
+  /// </dict>
+  /// </plist>
+  /// ```
+  ///
+  /// You must add `localhost` if any webview with this set to true opens a
+  /// local webpage, makes any localhost calls, or uses the isolation pattern
+  /// because Tauri uses the `localhost` domain for hosting the application
+  /// webpage, the IPC protocol, and the isolation pattern's iframe.
+  ///
+  /// Requests served through custom uri schemes are allowed so long as they use
+  /// a registrable domain specified in the `WKAppBoundDomains` array for all the
+  /// requests from the app, including requests for the `localhost` domain.
+  ///
+  /// In theory, you can whitelist an entire uri scheme by including the
+  /// protocol name followed by a colon. For example, to allow all requests
+  /// using a custom "stream" uri scheme (see [this tauri
+  /// example](https://github.com/tauri-apps/tauri/blob/dev/examples/streaming/main.rs)),
+  /// you could add `stream:` to the AppBoundDomains array. That said, I'm not
+  /// sure whether Apple would let your app through app review if you do
+  /// whitelist an entire protocol because this feature is not mentioned in
+  /// [their blog post on App-Bound
+  /// Domains](https://webkit.org/blog/10882/app-bound-domains/).
+  ///
+  /// See https://webkit.org/blog/10882/app-bound-domains/ and
+  /// https://developer.apple.com/documentation/webkit/wkwebviewconfiguration/limitsnavigationstoappbounddomains
+  /// for the official documentation on App-Bound Domains.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **iOS**: Supported since version 14.0+.
+  /// - **Linux / Windows / Android / MacOS:** Unsupported.
+  #[must_use]
+  pub fn limit_navigations_to_app_bound_domains(mut self, limit_navigations: bool) -> Self {
+    self.webview_attributes = self
+      .webview_attributes
+      .limit_navigations_to_app_bound_domains(limit_navigations);
     self
   }
 
@@ -1312,59 +1379,18 @@ fn main() {
   }
 }
 
-/// Wry APIs
-#[cfg(feature = "wry")]
-impl WebviewBuilder<crate::Wry> {
-  /// Set the environment for the webview.
-  /// Useful if you need to share the same environment, for instance when using the [`Self::on_new_window`].
-  #[cfg(windows)]
-  pub fn with_environment(
-    mut self,
-    environment: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment,
-  ) -> Self {
-    self
-      .platform_specific_attributes
-      .push(tauri_runtime_wry::WebviewAttribute::Environment(
-        environment,
-      ));
-    self
-  }
-
-  /// Creates a new webview sharing the same web process with the provided webview.
-  /// Useful if you need to link a webview to another, for instance when using the [`Self::on_new_window`].
-  #[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-  ))]
-  pub fn with_related_view(mut self, related_view: webkit2gtk::WebView) -> Self {
-    self
-      .platform_specific_attributes
-      .push(tauri_runtime_wry::WebviewAttribute::RelatedView(
-        related_view,
-      ));
-    self
-  }
-
-  /// Set the webview configuration.
-  /// Useful if you need to share the use a predefined webview configuration, for instance when using the [`Self::on_new_window`].
-  #[cfg(target_os = "macos")]
-  pub fn with_webview_configuration(
-    mut self,
-    webview_configuration: objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>,
-  ) -> Self {
-    self.platform_specific_attributes.push(
-      tauri_runtime_wry::WebviewAttribute::WebviewConfiguration(webview_configuration),
-    );
-    self
+#[cfg_attr(not(feature = "unstable"), allow(dead_code))]
+impl<R: Runtime> WebviewBuilder<R> {
+  /// Returns a mutable reference to the runtime-specific webview attributes.
+  ///
+  /// Mostly useful for runtime-specific extension traits (e.g. sharing a WebView2 environment with wry).
+  pub fn runtime_specific_attributes_mut(&mut self) -> &mut R::RuntimeWebviewAttributes {
+    &mut self.runtime_specific_attributes
   }
 }
 
 /// Webview.
-#[default_runtime(crate::Wry, wry)]
-pub struct Webview<R: Runtime> {
+pub struct Webview<R: Runtime = crate::DynRuntime> {
   pub(crate) window: Arc<Mutex<Window<R>>>,
   /// The webview created by the runtime.
   pub(crate) webview: DetachedWebview<EventLoopMessage, R>,
@@ -1373,6 +1399,8 @@ pub struct Webview<R: Runtime> {
   pub(crate) app_handle: AppHandle<R>,
   pub(crate) resources_table: Arc<Mutex<ResourceTable>>,
   use_https_scheme: bool,
+  /// DevTools preference from webview creation (`Some(false)` means inspector disabled).
+  pub(crate) devtools: Option<bool>,
 }
 
 impl<R: Runtime> std::fmt::Debug for Webview<R> {
@@ -1381,6 +1409,7 @@ impl<R: Runtime> std::fmt::Debug for Webview<R> {
       .field("window", &self.window.lock().unwrap())
       .field("webview", &self.webview)
       .field("use_https_scheme", &self.use_https_scheme)
+      .field("devtools", &self.devtools)
       .finish()
   }
 }
@@ -1394,6 +1423,7 @@ impl<R: Runtime> Clone for Webview<R> {
       app_handle: self.app_handle.clone(),
       resources_table: self.resources_table.clone(),
       use_https_scheme: self.use_https_scheme,
+      devtools: self.devtools,
     }
   }
 }
@@ -1420,6 +1450,7 @@ impl<R: Runtime> Webview<R> {
     window: Window<R>,
     webview: DetachedWebview<EventLoopMessage, R>,
     use_https_scheme: bool,
+    devtools: Option<bool>,
   ) -> Self {
     Self {
       manager: window.manager.clone(),
@@ -1428,6 +1459,7 @@ impl<R: Runtime> Webview<R> {
       webview,
       resources_table: Default::default(),
       use_https_scheme,
+      devtools,
     }
   }
 
@@ -1498,7 +1530,7 @@ impl<R: Runtime> Webview<R> {
   ///   some_value: String,
   /// }
   ///
-  /// tauri::Builder::<tauri::Wry>::new()
+  /// tauri::Builder::default()
   ///   .setup(|app| {
   ///     let webview = app.get_webview_window("main").unwrap();
   ///     let scope = webview.resolve_command_scope::<ScopeType>("my-plugin", "read");
@@ -1678,70 +1710,74 @@ impl<R: Runtime> Webview<R> {
   ///
   /// The closure is executed on the main thread.
   ///
-  /// Note that `webview2-com`, `webkit2gtk`, `objc2_web_kit` and similar crates may be updated in minor releases of Tauri.
+  /// Note that `webview2-com`, `webkit2gtk`, `objc2_web_kit`, `cef` (in case of CEF runtime) and similar crates may be updated in minor releases of Tauri.
   /// Therefore it's recommended to pin Tauri to at least a minor version when you're using `with_webview`.
+  ///
+  /// The closure receives a [`PlatformWebview`](crate::webview::PlatformWebview), which dereferences
+  /// to the webview type defined by the runtime in use (e.g. `tauri_runtime_wry::Webview`).
+  /// When using the type-erased [`DynRuntime`](crate::DynRuntime) (the default), use
+  /// [`PlatformWebview::downcast_ref`](crate::webview::PlatformWebview::downcast_ref) to reach it,
+  /// or the extension traits provided by the runtime crate (e.g. `tauri_runtime_wry::WebviewWryExt::with_wry_webview`).
   ///
   /// # Examples
   ///
-  #[cfg_attr(
-    feature = "unstable",
-    doc = r####"
-```rust,no_run
-use tauri::Manager;
-
-tauri::Builder::<tauri::Wry>::new()
-  .setup(|app| {
-    let main_webview = app.get_webview("main").unwrap();
-    main_webview.with_webview(|webview| {
-      #[cfg(target_os = "linux")]
-      {
-        // see <https://docs.rs/webkit2gtk/2.0.0/webkit2gtk/struct.WebView.html>
-        // and <https://docs.rs/webkit2gtk/2.0.0/webkit2gtk/trait.WebViewExt.html>
-        use webkit2gtk::WebViewExt;
-        webview.inner().set_zoom_level(4.);
-      }
-
-      #[cfg(windows)]
-      unsafe {
-        // see https://docs.rs/webview2-com/0.19.1/webview2_com/Microsoft/Web/WebView2/Win32/struct.ICoreWebView2Controller.html
-        webview.controller().SetZoomFactor(4.).unwrap();
-      }
-
-      #[cfg(target_os = "macos")]
-      unsafe {
-        let view: &objc2_web_kit::WKWebView = &*webview.inner().cast();
-        let controller: &objc2_web_kit::WKUserContentController = &*webview.controller().cast();
-        let window: &objc2_app_kit::NSWindow = &*webview.ns_window().cast();
-
-        view.setPageZoom(4.);
-        controller.removeAllUserScripts();
-        let bg_color = objc2_app_kit::NSColor::colorWithDeviceRed_green_blue_alpha(0.5, 0.2, 0.4, 1.);
-        window.setBackgroundColor(Some(&bg_color));
-      }
-
-      #[cfg(target_os = "android")]
-      {
-        use jni::objects::JValue;
-        webview.jni_handle().exec(|env, _, webview| {
-          env.call_method(webview, "zoomBy", "(F)V", &[JValue::Float(4.)]).unwrap();
-        })
-      }
-    });
-    Ok(())
-});
-```
-  "####
-  )]
-  #[cfg(feature = "wry")]
-  #[cfg_attr(docsrs, doc(feature = "wry"))]
-  pub fn with_webview<F: FnOnce(PlatformWebview) + Send + 'static>(
+  /// ```rust,ignore
+  /// use tauri::Manager;
+  ///
+  /// tauri::Builder::default()
+  ///   .runtime(tauri_runtime_wry::Wry::default())
+  ///   .setup(|app| {
+  ///     let main_webview = app.get_webview_window("main").unwrap();
+  ///     main_webview.with_webview(|webview| {
+  ///       let Some(webview) = webview.downcast_ref::<tauri_runtime_wry::Webview>() else {
+  ///         return;
+  ///       };
+  ///
+  ///       #[cfg(target_os = "linux")]
+  ///       {
+  ///         // see <https://docs.rs/webkit2gtk/2.0.0/webkit2gtk/struct.WebView.html>
+  ///         // and <https://docs.rs/webkit2gtk/2.0.0/webkit2gtk/trait.WebViewExt.html>
+  ///         use webkit2gtk::WebViewExt;
+  ///         webview.inner().set_zoom_level(4.);
+  ///       }
+  ///
+  ///       #[cfg(windows)]
+  ///       unsafe {
+  ///         // see <https://docs.rs/webview2-com/0.19.1/webview2_com/Microsoft/Web/WebView2/Win32/struct.ICoreWebView2Controller.html>
+  ///         webview.controller().SetZoomFactor(4.).unwrap();
+  ///       }
+  ///
+  ///       #[cfg(target_os = "macos")]
+  ///       unsafe {
+  ///         let view: &objc2_web_kit::WKWebView = &*webview.inner().cast();
+  ///         let controller: &objc2_web_kit::WKUserContentController = &*webview.controller().cast();
+  ///         let window: &objc2_app_kit::NSWindow = &*webview.ns_window().cast();
+  ///
+  ///         view.setPageZoom(4.);
+  ///         controller.removeAllUserScripts();
+  ///         let bg_color = objc2_app_kit::NSColor::colorWithDeviceRed_green_blue_alpha(0.5, 0.2, 0.4, 1.);
+  ///         window.setBackgroundColor(Some(&bg_color));
+  ///       }
+  ///
+  ///       #[cfg(target_os = "android")]
+  ///       {
+  ///         use jni::objects::JValue;
+  ///         webview.jni_handle().exec(|env, _, webview| {
+  ///           env.call_method(webview, "zoomBy", "(F)V", &[JValue::Float(4.)]).unwrap();
+  ///         })
+  ///       }
+  ///     });
+  ///     Ok(())
+  ///   });
+  /// ```
+  pub fn with_webview<F: FnOnce(PlatformWebview<R>) + Send + 'static>(
     &self,
     f: F,
   ) -> crate::Result<()> {
     self
       .webview
       .dispatcher
-      .with_webview(|w| f(PlatformWebview(*w.downcast().unwrap())))
+      .with_webview(|w| f(PlatformWebview(w)))
       .map_err(Into::into)
   }
 
@@ -1789,7 +1825,7 @@ tauri::Builder::<tauri::Wry>::new()
 
     // if from `tauri://` custom protocol
     ({
-      let protocol_url = Url::parse(&R::custom_scheme_url("tauri", uses_https)).unwrap();
+      let protocol_url = Url::parse(&self.manager().custom_scheme_url("tauri", uses_https)).unwrap();
       current_url.scheme() == protocol_url.scheme()
       && current_url.domain() == protocol_url.domain()
     }) ||
@@ -1803,8 +1839,13 @@ tauri::Builder::<tauri::Wry>::new()
 
       // or from a custom protocol registered by the user
       || ({
-        let protocol_urls = self.manager().webview.uri_scheme_protocols.lock().unwrap().keys().map(|url| Url::parse(&R::custom_scheme_url(url, uses_https)).unwrap()).collect::<Vec<_>>();
-        protocol_urls.iter().any(|url| url.scheme() == current_url.scheme() && url.domain() == current_url.domain())
+        let protocols = self.manager().webview.uri_scheme_protocols.lock().unwrap();
+
+        protocols.keys().any(|protocol| {
+          let protocol_url = Url::parse(&self.manager().custom_scheme_url(protocol, uses_https)).unwrap();
+
+          is_url_for_custom_protocol(current_url, protocol, &protocol_url)
+        })
       })
   }
 
@@ -1886,8 +1927,11 @@ tauri::Builder::<tauri::Wry>::new()
       (plugin, command)
     });
 
-    // we only check ACL on plugin commands or if the app defined its ACL manifest
-    if (plugin_command.is_some() || has_app_acl_manifest)
+    // Check ACL on plugin commands, when the app defined its ACL manifest,
+    // or when the request comes from a non-local (remote) origin.  This
+    // ensures remote content can never reach custom commands unless an
+    // explicit `remote` capability has been configured for them.
+    if (plugin_command.is_some() || has_app_acl_manifest || !is_local)
       // TODO: Remove this special check in v3
       && request.cmd != crate::ipc::channel::FETCH_CHANNEL_DATA_COMMAND
       && invoke.acl.is_none()
@@ -1921,56 +1965,55 @@ tauri::Builder::<tauri::Wry>::new()
     if let Some((plugin, command_name)) = plugin_command {
       invoke.message.command = command_name;
 
+      #[cfg(desktop)]
       let command = invoke.message.command.clone();
 
       #[cfg(mobile)]
       let message = invoke.message.clone();
 
       #[allow(unused_mut)]
-      let mut handled = manager.extend_api(plugin, invoke);
+      let mut handled = manager.run_plugin_invoke_handler(plugin, invoke);
+
+      if handled {
+        return;
+      }
 
       #[cfg(mobile)]
       {
-        if !handled {
-          handled = true;
+        fn load_channels<R: Runtime>(payload: &serde_json::Value, webview: &Webview<R>) {
+          use std::str::FromStr;
 
-          fn load_channels<R: Runtime>(payload: &serde_json::Value, webview: &Webview<R>) {
-            use std::str::FromStr;
-
-            if let serde_json::Value::Object(map) = payload {
-              for v in map.values() {
-                if let serde_json::Value::String(s) = v {
-                  let _ = crate::ipc::JavaScriptChannelId::from_str(s)
-                    .map(|id| id.channel_on::<R, ()>(webview.clone()));
-                }
+          if let serde_json::Value::Object(map) = payload {
+            for v in map.values() {
+              if let serde_json::Value::String(s) = v {
+                let _ = crate::ipc::JavaScriptChannelId::from_str(s)
+                  .map(|id| id.channel_on::<R, ()>(webview.clone()));
               }
             }
           }
+        }
 
-          let payload = message.payload.into_json();
-          // initialize channels
-          load_channels(&payload, &message.webview);
+        let payload = message.payload.into_json();
+        // initialize channels
+        load_channels(&payload, &message.webview);
 
-          let resolver_ = resolver.clone();
-          if let Err(e) = crate::plugin::mobile::run_command(
-            plugin,
-            &app_handle,
-            heck::AsLowerCamelCase(message.command).to_string(),
-            payload,
-            move |response| match response {
-              Ok(r) => resolver_.resolve(r),
-              Err(e) => resolver_.reject(e),
-            },
-          ) {
-            resolver.reject(e.to_string());
-            return;
-          }
+        let resolver_ = resolver.clone();
+        if let Err(e) = crate::plugin::mobile::run_command(
+          plugin,
+          &app_handle,
+          heck::AsLowerCamelCase(message.command).to_string(),
+          payload,
+          move |response| match response {
+            Ok(r) => resolver_.resolve(r),
+            Err(e) => resolver_.reject(e),
+          },
+        ) {
+          resolver.reject(e.to_string());
         }
       }
 
-      if !handled {
-        resolver.reject(format!("Command {command} not found"));
-      }
+      #[cfg(desktop)]
+      resolver.reject(format!("Command {command} not found"));
     } else {
       let command = invoke.message.command.clone();
       let handled = manager.run_invoke_handler(invoke);
@@ -1986,6 +2029,22 @@ tauri::Builder::<tauri::Wry>::new()
       .webview
       .dispatcher
       .eval_script(js.into())
+      .map_err(Into::into)
+  }
+
+  /// Evaluate JavaScript with callback function on this webview.
+  /// The evaluation result will be serialized into a JSON string and passed to the callback function.
+  ///
+  /// Exception is ignored because of the limitation on Windows. You can catch it yourself and return as string as a workaround.
+  pub fn eval_with_callback(
+    &self,
+    js: impl Into<String>,
+    callback: impl Fn(String) + Send + 'static,
+  ) -> crate::Result<()> {
+    self
+      .webview
+      .dispatcher
+      .eval_script_with_callback(js.into(), callback)
       .map_err(Into::into)
   }
 
@@ -2046,7 +2105,7 @@ tauri::Builder::<tauri::Wry>::new()
     doc = r####"
 ```rust,no_run
 use tauri::Manager;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     #[cfg(debug_assertions)]
     app.get_webview("main").unwrap().open_devtools();
@@ -2077,7 +2136,7 @@ tauri::Builder::<tauri::Wry>::new()
     doc = r####"
 ```rust,no_run
 use tauri::Manager;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     #[cfg(debug_assertions)]
     {
@@ -2115,7 +2174,7 @@ tauri::Builder::<tauri::Wry>::new()
     doc = r####"
 ```rust,no_run
 use tauri::Manager;
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     #[cfg(debug_assertions)]
     {
@@ -2252,72 +2311,12 @@ tauri::Builder::<tauri::Wry>::new()
   }
 }
 
-/// APIs specific to the CEF runtime.
-#[cfg(feature = "cef")]
-impl Webview<crate::Cef> {
-  /// Send a message to the DevTools agent. The message should be a UTF-8 encoded JSON
-  /// string following the Chrome DevTools Protocol format.
+impl<R: Runtime> Webview<R> {
+  /// Returns the runtime dispatcher of this webview.
   ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// use tauri::Manager;
-  ///
-  /// tauri::Builder::<tauri::Cef>::new()
-  ///   .setup(|app| {
-  ///     let webview = app.get_webview("main").unwrap();
-  ///     // Enable Page domain to receive page lifecycle events
-  ///     let msg = br#"{"id":1,"method":"Page.enable","params":{}}"#;
-  ///     webview.send_dev_tools_message(msg)?;
-  ///     Ok(())
-  ///   });
-  /// ```
-  pub fn send_dev_tools_message(&self, message: &[u8]) -> crate::Result<()> {
-    self
-      .webview
-      .dispatcher
-      .send_dev_tools_message(message)
-      .map_err(Into::into)
-  }
-
-  /// Register a callback to receive DevTools protocol messages. Messages include
-  /// both method results and events from the DevTools agent.
-  ///
-  /// # Examples
-  ///
-  /// ```rust,no_run
-  /// use tauri::{Manager, CefDevToolsProtocol};
-  ///
-  /// tauri::Builder::<tauri::Cef>::new()
-  ///   .setup(|app| {
-  ///     let webview = app.get_webview("main").unwrap();
-  ///     webview.on_dev_tools_protocol(|protocol| {
-  ///       match protocol {
-  ///         CefDevToolsProtocol::Message(msg) => {
-  ///           if let Ok(s) = std::str::from_utf8(&msg) {
-  ///             println!("DevTools message: {}", s);
-  ///           }
-  ///         }
-  ///         CefDevToolsProtocol::Event { method, params } => {
-  ///           println!("DevTools event: {} {:?}", method, params);
-  ///         }
-  ///         CefDevToolsProtocol::MethodResult { message_id, success, result } => {
-  ///           println!("DevTools result: id={} success={}", message_id, success);
-  ///         }
-  ///       }
-  ///     })?;
-  ///     Ok(())
-  ///   });
-  /// ```
-  pub fn on_dev_tools_protocol<F: Fn(CefDevToolsProtocol) + Send + Sync + 'static>(
-    &self,
-    f: F,
-  ) -> crate::Result<()> {
-    self
-      .webview
-      .dispatcher
-      .on_dev_tools_protocol(f)
-      .map_err(Into::into)
+  /// Mostly useful for runtime-specific extension traits.
+  pub fn dispatcher(&self) -> &R::WebviewDispatcher {
+    &self.webview.dispatcher
   }
 }
 
@@ -2331,7 +2330,7 @@ impl<R: Runtime> Listener<R> for Webview<R> {
 ```
 use tauri::{Manager, Listener};
 
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let webview = app.get_webview("main").unwrap();
     webview.listen("component-loaded", move |event| {
@@ -2383,7 +2382,7 @@ tauri::Builder::<tauri::Wry>::new()
 ```
 use tauri::{Manager, Listener};
 
-tauri::Builder::<tauri::Wry>::new()
+tauri::Builder::default()
   .setup(|app| {
     let webview = app.get_webview("main").unwrap();
     let webview_ = webview.clone();
@@ -2435,6 +2434,16 @@ impl<R: Runtime> ManagerBase<R> for Webview<R> {
   fn managed_app_handle(&self) -> &AppHandle<R> {
     &self.app_handle
   }
+
+  #[cfg(target_os = "android")]
+  fn activity_name(&self) -> Option<crate::Result<String>> {
+    Some(self.window().activity_name())
+  }
+
+  #[cfg(target_os = "ios")]
+  fn scene_identifier(&self) -> Option<crate::Result<String>> {
+    Some(self.window().scene_identifier())
+  }
 }
 
 impl<'de, R: Runtime> CommandArg<'de, R> for Webview<R> {
@@ -2464,25 +2473,154 @@ impl<T: ScopeObject> ResolvedScope<T> {
 
 #[cfg(test)]
 mod tests {
+  use url::Url;
+
+  #[test]
+  fn no_permission_handler_preserves_runtime_default() {
+    use crate::test::{mock_builder, mock_context, noop_assets};
+
+    let app = mock_builder().build(mock_context(noop_assets())).unwrap();
+    let pending = super::WebviewBuilder::new("test", crate::WebviewUrl::default())
+      .into_pending_webview(&app, "test")
+      .unwrap();
+
+    assert!(pending.permission_request_handler.is_none());
+  }
+
+  fn test_webview_window() -> crate::WebviewWindow<crate::test::MockRuntime> {
+    use crate::test::{mock_builder, mock_context, noop_assets};
+
+    // Create a mock app with proper context
+    let app = mock_builder().build(mock_context(noop_assets())).unwrap();
+
+    // Create a webview window
+    crate::WebviewWindowBuilder::new(&app, "test", crate::WebviewUrl::default())
+      .build()
+      .unwrap()
+  }
+
   #[test]
   fn webview_is_send_sync() {
     crate::test_utils::assert_send::<super::Webview>();
     crate::test_utils::assert_sync::<super::Webview>();
   }
 
+  #[test]
+  fn tauri_protocol_is_local() {
+    let webview = test_webview_window().webview;
+
+    assert!(webview.is_local_url(&Url::parse("tauri://localhost/").unwrap()));
+  }
+
+  #[test]
+  fn direct_custom_protocol_is_local() {
+    use crate::test::{mock_builder, mock_context, noop_assets};
+
+    let app = mock_builder()
+      .register_uri_scheme_protocol("myproto", |_, _| {
+        http::Response::builder().body(Vec::new()).unwrap()
+      })
+      .build(mock_context(noop_assets()))
+      .unwrap();
+    let webview = crate::WebviewWindowBuilder::new(&app, "test", crate::WebviewUrl::default())
+      .build()
+      .unwrap()
+      .webview;
+
+    let url = |s| Url::parse(s).unwrap();
+
+    assert!(webview.is_local_url(&url("myproto://localhost/")));
+    assert!(!webview.is_local_url(&url("https://myproto.localhost/")));
+  }
+
+  #[test]
+  fn http_custom_protocol_rejects_spoofed_domain() {
+    let protocol_url = Url::parse("https://myproto.localhost/").unwrap();
+    let url = |s| Url::parse(s).unwrap();
+
+    assert!(super::is_url_for_custom_protocol(
+      &url("https://myproto.localhost/"),
+      "myproto",
+      &protocol_url
+    ));
+
+    // Attacker domain that starts with a registered protocol name must not be local.
+    assert!(!super::is_url_for_custom_protocol(
+      &url("https://myproto.evil.com/"),
+      "myproto",
+      &protocol_url
+    ));
+    assert!(!super::is_url_for_custom_protocol(
+      &url("https://notregistered.localhost/"),
+      "myproto",
+      &protocol_url
+    ));
+  }
+
+  /// Custom (non-plugin) commands must be rejected when the IPC request
+  /// originates from a remote URL, even when no `AppManifest` has been
+  /// configured.  Only local (bundled) origins should be able to reach
+  /// custom commands.
+  #[test]
+  fn remote_origin_blocked_for_custom_commands_without_app_manifest() {
+    use crate::test::{INVOKE_KEY, mock_builder, mock_context, noop_assets};
+    use crate::webview::InvokeRequest;
+
+    let app = mock_builder().build(mock_context(noop_assets())).unwrap();
+
+    let webview = crate::WebviewWindowBuilder::new(&app, "main", Default::default())
+      .build()
+      .unwrap();
+
+    // Request from a remote origin for a custom (non-plugin) command
+    // - should be rejected even without an AppManifest.
+    let remote_result = crate::test::get_ipc_response(
+      &webview,
+      InvokeRequest {
+        cmd: "any_custom_command".into(),
+        callback: crate::ipc::CallbackFn(0),
+        error: crate::ipc::CallbackFn(1),
+        url: "https://evil.com".parse().unwrap(),
+        body: crate::ipc::InvokeBody::default(),
+        headers: Default::default(),
+        invoke_key: INVOKE_KEY.to_string(),
+      },
+    );
+    assert!(
+      remote_result.is_err(),
+      "custom command should be rejected from a remote origin"
+    );
+
+    // Same command from the local origin - should NOT be rejected by the
+    // remote-origin guard (it may still fail because the command doesn't
+    // exist, but the error message will be different).
+    let local_result = crate::test::get_ipc_response(
+      &webview,
+      InvokeRequest {
+        cmd: "any_custom_command".into(),
+        callback: crate::ipc::CallbackFn(0),
+        error: crate::ipc::CallbackFn(1),
+        url: "tauri://localhost".parse().unwrap(),
+        body: crate::ipc::InvokeBody::default(),
+        headers: Default::default(),
+        invoke_key: INVOKE_KEY.to_string(),
+      },
+    );
+    // The local request should either succeed or fail for a reason OTHER
+    // than "not allowed from remote context".
+    if let Err(e) = &local_result {
+      let msg = e.to_string();
+      assert!(
+        !msg.contains("not allowed from remote context"),
+        "local origin should not be blocked by the remote-origin guard, got: {msg}"
+      );
+    }
+  }
+
   #[cfg(target_os = "macos")]
   #[test]
   fn test_webview_window_has_set_simple_fullscreen_method() {
-    use crate::test::{mock_builder, mock_context, noop_assets};
-
-    // Create a mock app with proper context
-    let app = mock_builder().build(mock_context(noop_assets())).unwrap();
-
-    // Get or create a webview window
-    let webview_window =
-      crate::WebviewWindowBuilder::new(&app, "test", crate::WebviewUrl::default())
-        .build()
-        .unwrap();
+    let webview_window = test_webview_window();
 
     // This should compile if set_simple_fullscreen exists
     let result = webview_window.set_simple_fullscreen(true);

@@ -46,7 +46,7 @@ pub fn command(options: Options) -> Result<()> {
   let description = match options.description {
     Some(d) => Some(d),
     None => prompts::input::<String>("What's the permission description?", None, false, true)?
-      .and_then(|d| if d.is_empty() { None } else { Some(d) }),
+      .filter(|d| !d.is_empty()),
   };
 
   let allow: Vec<String> = options
@@ -113,6 +113,7 @@ pub fn command(options: Options) -> Result<()> {
         default: None,
         set: Vec::new(),
         permission: vec![permission],
+        commands: Vec::new(),
       })
       .context("failed to serialize permission")?,
   )

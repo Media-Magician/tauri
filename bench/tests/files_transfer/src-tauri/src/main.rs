@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The benchmark can't use this or we can't measure the command time
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::read;
 use tauri::{AppHandle, Manager, Runtime, command, ipc::Response, path::BaseDirectory};
@@ -22,12 +23,12 @@ async fn read_file<R: Runtime>(app: AppHandle<R>) -> Result<Response, String> {
   Ok(Response::new(contents))
 }
 
-#[cfg_attr(feature = "cef", tauri::cef_entry_point)]
+#[cfg_attr(feature = "cef", tauri_runtime_cef::cef_entry_point)]
 fn main() {
   #[cfg(feature = "cef")]
-  let builder = tauri::Builder::<tauri::Cef>::default();
+  let builder = tauri::Builder::default().runtime(tauri_runtime_cef::Cef::default());
   #[cfg(not(feature = "cef"))]
-  let builder = tauri::Builder::<tauri::Wry>::new();
+  let builder = tauri::Builder::default().runtime(tauri_runtime_wry::Wry::default());
 
   builder
     .invoke_handler(tauri::generate_handler![app_should_close, read_file])

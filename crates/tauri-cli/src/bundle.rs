@@ -43,7 +43,7 @@ impl ValueEnum for BundleFormat {
   }
 
   fn to_possible_value(&self) -> Option<PossibleValue> {
-    let hide = self.0 == PackageType::Updater;
+    let hide = (!cfg!(windows) && self.0 == PackageType::Nsis) || self.0 == PackageType::Updater;
     Some(PossibleValue::new(self.0.short_name()).hide(hide))
   }
 }
@@ -100,6 +100,15 @@ pub struct Options {
   /// are not available or not needed.
   #[clap(long)]
   pub no_sign: bool,
+
+  /// Skip patching the main executable with bundle type information.
+  ///
+  /// The patching rewrites the binary in place, invalidating an existing code
+  /// signature. Skipping it preserves an already-signed binary at the cost of
+  /// per-bundle-type updater support (only relevant when shipping multiple
+  /// bundle types per platform).
+  #[clap(long)]
+  pub no_binary_patching: bool,
 }
 
 impl From<crate::build::Options> for Options {
@@ -113,6 +122,7 @@ impl From<crate::build::Options> for Options {
       config: value.config,
       skip_stapling: value.skip_stapling,
       no_sign: value.no_sign,
+      no_binary_patching: value.no_binary_patching,
     }
   }
 }
@@ -146,8 +156,6 @@ pub fn command(options: Options, verbosity: u8) -> crate::Result<()> {
   let interface_options = options.clone().into();
 
   let out_dir = app_settings.out_dir(&interface_options, dirs.tauri)?;
-
-  interface.on_before_bundle(&interface_options, &dirs)?;
 
   bundle(
     &options,
@@ -209,8 +217,9 @@ pub fn bundle<A: AppSettings>(
       package_types,
       dirs.tauri,
     )
-    .with_context(|| "failed to build bundler settings")?;
+    .context("failed to build bundler settings")?;
   settings.set_no_sign(options.no_sign);
+  settings.set_binary_patching(!options.no_binary_patching);
 
   settings.set_log_level(match verbosity {
     0 => log::Level::Error,
@@ -218,7 +227,7 @@ pub fn bundle<A: AppSettings>(
     _ => log::Level::Trace,
   });
 
-  let bundles = tauri_bundler::bundle_project(&settings).map_err(Box::new)?;
+  let bundles = tauri_bundler::bundle_project(&settings)?;
 
   sign_updaters(settings, bundles, ci)?;
 
@@ -289,6 +298,9 @@ fn sign_updaters(
   } else {
     private_key
   };
+  if password.is_none() {
+    log::info!("Decrypting updater signing key, expect a prompt for password")
+  }
   let secret_key =
     updater_signature::secret_key(private_key, password).context("failed to decode secret key")?;
   let public_key = updater_signature::pub_key(pubkey).context("failed to decode pubkey")?;

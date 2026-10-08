@@ -15,13 +15,15 @@ pub use anyhow::Result;
 use cargo_toml::Manifest;
 
 use tauri_utils::{
-  config::{BundleResources, Config, WebviewInstallMode},
+  config::Config,
   resources::{ResourcePaths, external_binaries},
 };
 
 use std::{
   collections::HashMap,
-  env, fs,
+  env,
+  ffi::OsStr,
+  fs,
   path::{Path, PathBuf},
 };
 
@@ -80,24 +82,6 @@ fn copy_binaries(
       fs::remove_file(&dest).unwrap();
     }
     copy_file(&src, &dest)?;
-  }
-  Ok(())
-}
-
-/// Copies resources to a path.
-fn copy_resources(resources: ResourcePaths<'_>, path: &Path) -> Result<()> {
-  let path = path.canonicalize()?;
-  for resource in resources.iter() {
-    let resource = resource?;
-
-    println!("cargo:rerun-if-changed={}", resource.path().display());
-
-    // avoid copying the resource if target is the same as source
-    let src = resource.path().canonicalize()?;
-    let target = path.join(resource.target());
-    if src != target {
-      copy_file(src, target)?;
-    }
   }
   Ok(())
 }
@@ -201,6 +185,62 @@ fn copy_frameworks(dest_dir: &Path, frameworks: &[String]) -> Result<()> {
   Ok(())
 }
 
+// TODO: far from ideal, but there's no other way to get the target dir, see <https://github.com/rust-lang/cargo/issues/5457>
+// resolves the profile directory `OUT_DIR` resides under, which is
+// `<dir>/build/<pkg>-<hash>/out` on stable and `<dir>/build/<pkg>/<hash>/out`
+// on recent nightlies, so we walk up to the `build` dir and take its parent
+// instead of assuming a fixed depth. This is the directory cargo places final
+// artifacts in unless the `build.build-dir` config moves intermediate
+// artifacts elsewhere — see [`artifact_profile_dir`].
+fn build_profile_dir_from_out_dir(out_dir: &Path) -> Option<&Path> {
+  out_dir
+    .ancestors()
+    .find(|path| path.file_name() == Some(OsStr::new("build")))
+    .and_then(|build_dir| build_dir.parent())
+}
+
+/// Resolves the directory cargo places final artifacts in for the current
+/// profile, given the profile directory `OUT_DIR` resides under.
+///
+/// The two only differ when the `build.build-dir` config (stabilized in Rust
+/// 1.100) moves intermediate artifacts away from the target directory: the
+/// executable still lands in `<target>[/<triple>]/<profile>`, so staged files
+/// must follow it there instead of sitting next to the build script output.
+/// The split is only detectable when configured through the
+/// `CARGO_BUILD_BUILD_DIR` environment variable — a `build-dir` set in
+/// `.cargo/config.toml` is not visible to build scripts, and that case still
+/// stages into the build dir.
+fn artifact_profile_dir(build_profile_dir: &Path) -> PathBuf {
+  fn resolve(build_profile_dir: &Path) -> Option<PathBuf> {
+    // `cargo metadata` reports both roots with config and template variables
+    // resolved, and the `[<triple>/]<profile>` suffix mirrors between them
+    let output = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+      .args(["metadata", "--format-version", "1", "--no-deps"])
+      .output()
+      .ok()?;
+    if !output.status.success() {
+      return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let target_directory = PathBuf::from(metadata.get("target_directory")?.as_str()?);
+    let build_directory = Path::new(metadata.get("build_directory")?.as_str()?);
+    let profile_suffix = build_profile_dir
+      .strip_prefix(build_directory)
+      .ok()
+      .or_else(|| {
+        build_profile_dir
+          .strip_prefix(build_directory.canonicalize().ok()?)
+          .ok()
+      })?;
+    Some(target_directory.join(profile_suffix))
+  }
+
+  if env::var_os("CARGO_BUILD_BUILD_DIR").is_none() {
+    return build_profile_dir.to_path_buf();
+  }
+  resolve(build_profile_dir).unwrap_or_else(|| build_profile_dir.to_path_buf())
+}
+
 // creates a cfg alias if `has_feature` is true.
 // `alias` must be a snake case string.
 fn cfg_alias(alias: &str, has_feature: bool) {
@@ -210,11 +250,29 @@ fn cfg_alias(alias: &str, has_feature: bool) {
   }
 }
 
+/// Whether the application links the CEF runtime.
+///
+/// `tauri-runtime-cef` emits a `cargo:runtime=cef` instruction from its build script, which cargo
+/// exposes to the build scripts of its direct dependents (the application) as `DEP_TAURI_RUNTIME_CEF_RUNTIME`.
+fn uses_cef_runtime() -> bool {
+  env::var("DEP_TAURI_RUNTIME_CEF_RUNTIME").as_deref() == Ok("cef")
+}
+
+fn default_windows_app_manifest() -> &'static str {
+  if uses_cef_runtime() {
+    include_str!("windows-cef-app-manifest.xml")
+  } else {
+    include_str!("windows-app-manifest.xml")
+  }
+}
+
 /// Attributes used on Windows.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct WindowsAttributes {
   window_icon_path: Option<PathBuf>,
+  /// Whether to statically link the Visual C++ runtime into the application binary on Windows MSVC targets
+  static_vc_runtime: Option<bool>,
   /// A string containing an [application manifest] to be included with the application on Windows.
   ///
   /// Defaults to:
@@ -242,6 +300,8 @@ pub struct WindowsAttributes {
   ///
   /// [application manifest]: https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests
   app_manifest: Option<String>,
+  /// A series of strings containing additional .rc content to be appended to the generated resource file on Windows.
+  append_rc_content: Vec<String>,
 }
 
 impl Default for WindowsAttributes {
@@ -255,7 +315,9 @@ impl WindowsAttributes {
   pub fn new() -> Self {
     Self {
       window_icon_path: Default::default(),
-      app_manifest: Some(include_str!("windows-app-manifest.xml").into()),
+      static_vc_runtime: None,
+      append_rc_content: Vec::new(),
+      app_manifest: Some(default_windows_app_manifest().into()),
     }
   }
 
@@ -265,6 +327,8 @@ impl WindowsAttributes {
     Self {
       app_manifest: None,
       window_icon_path: Default::default(),
+      static_vc_runtime: None,
+      append_rc_content: Vec::new(),
     }
   }
 
@@ -275,6 +339,15 @@ impl WindowsAttributes {
     self
       .window_icon_path
       .replace(window_icon_path.as_ref().into());
+    self
+  }
+
+  /// Sets whether to statically link the Visual C++ runtime into the application binary on Windows MSVC targets.
+  ///
+  /// If unset, this is read from `build > windows > staticVCRuntime` in the Tauri configuration.
+  #[must_use]
+  pub fn static_vc_runtime(mut self, static_vc_runtime: bool) -> Self {
+    self.static_vc_runtime.replace(static_vc_runtime);
     self
   }
 
@@ -334,6 +407,14 @@ impl WindowsAttributes {
     self.app_manifest = Some(manifest.as_ref().to_string());
     self
   }
+
+  /// Append additional .rc content to the generated resource file on Windows.
+  /// This can be called multiple times to append multiple contents.
+  #[must_use]
+  pub fn append_rc_content<S: Into<String>>(mut self, content: S) -> Self {
+    self.append_rc_content.push(content.into());
+    self
+  }
 }
 
 /// The attributes used on the build.
@@ -342,6 +423,7 @@ pub struct Attributes {
   #[allow(dead_code)]
   windows_attributes: WindowsAttributes,
   capabilities_path_pattern: Option<&'static str>,
+  config_path: Option<PathBuf>,
   #[cfg(feature = "codegen")]
   codegen: Option<codegen::context::CodegenContext>,
   inlined_plugins: HashMap<&'static str, InlinedPlugin>,
@@ -359,6 +441,85 @@ impl Attributes {
   pub fn windows_attributes(mut self, windows_attributes: WindowsAttributes) -> Self {
     self.windows_attributes = windows_attributes;
     self
+  }
+
+  /// Set the glob pattern to be used to find the capabilities.
+  ///
+  /// **WARNING:** The `removeUnusedCommands` option does not work with a custom capabilities path.
+  ///
+  /// **Note:** You must emit [rerun-if-changed] instructions for your capabilities directory.
+  ///
+  /// [rerun-if-changed]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed
+  #[must_use]
+  pub fn capabilities_path_pattern(mut self, pattern: &'static str) -> Self {
+    self.capabilities_path_pattern.replace(pattern);
+    self
+  }
+
+  /// Adds the given plugin to the list of inlined plugins (a plugin that is part of your application).
+  ///
+  /// See [`InlinedPlugin`] for more information.
+  pub fn plugin(mut self, name: &'static str, plugin: InlinedPlugin) -> Self {
+    self.inlined_plugins.insert(name, plugin);
+    self
+  }
+
+  /// Adds the given list of plugins to the list of inlined plugins (a plugin that is part of your application).
+  ///
+  /// See [`InlinedPlugin`] for more information.
+  pub fn plugins<I>(mut self, plugins: I) -> Self
+  where
+    I: IntoIterator<Item = (&'static str, InlinedPlugin)>,
+  {
+    self.inlined_plugins.extend(plugins);
+    self
+  }
+
+  /// Set the path to the `tauri.conf.json` (relative to the crate's directory).
+  ///
+  /// This defaults to a file called `tauri.conf.json` inside of the current working directory of
+  /// the crate compiling; does not need to be set manually if that config file is in the same
+  /// directory as your `Cargo.toml`.
+  pub fn config_path(mut self, config_path: impl Into<PathBuf>) -> Self {
+    self.config_path = Some(config_path.into());
+    self
+  }
+
+  /// Sets the application manifest for the Access Control List.
+  ///
+  /// See [`AppManifest`] for more information.
+  pub fn app_manifest(mut self, manifest: AppManifest) -> Self {
+    self.app_manifest = manifest;
+    self
+  }
+
+  #[cfg(feature = "codegen")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "codegen")))]
+  #[must_use]
+  pub fn codegen(mut self, codegen: codegen::context::CodegenContext) -> Self {
+    self.codegen.replace(codegen);
+    self
+  }
+}
+
+/// The attributes used by [`try_build_context`].
+///
+/// Unlike [`Attributes`], this only carries the inputs that shape the generated
+/// context and its Access Control List — there is nothing executable-specific
+/// (Windows resources, icons, artifact staging) to configure here.
+#[derive(Debug, Default)]
+pub struct ContextAttributes {
+  capabilities_path_pattern: Option<&'static str>,
+  #[cfg(feature = "codegen")]
+  codegen: Option<codegen::context::CodegenContext>,
+  inlined_plugins: HashMap<&'static str, InlinedPlugin>,
+  app_manifest: AppManifest,
+}
+
+impl ContextAttributes {
+  /// Creates the default attribute set.
+  pub fn new() -> Self {
+    Self::default()
   }
 
   /// Set the glob pattern to be used to find the capabilities.
@@ -411,7 +572,8 @@ impl Attributes {
 }
 
 pub fn is_dev() -> bool {
-  env::var("DEP_TAURI_DEV").expect("missing `cargo:dev` instruction, please update tauri to latest")
+  env::var_os("DEP_TAURI_DEV")
+    .expect("missing `cargo:dev` instruction, please update tauri to latest")
     == "true"
 }
 
@@ -453,21 +615,10 @@ pub fn build() {
   }
 }
 
-/// Same as [`build()`], but takes an extra configuration argument, and does not panic.
-#[allow(unused_variables)]
-pub fn try_build(attributes: Attributes) -> Result<()> {
-  use anyhow::anyhow;
-
-  println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
-
-  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-  let mobile = target_os == "ios" || target_os == "android";
-  cfg_alias("desktop", !mobile);
-  cfg_alias("mobile", mobile);
-
-  let target_triple = env::var("TARGET").unwrap();
-  let target = tauri_utils::platform::Target::from_triple(&target_triple);
-
+/// Parses the Tauri configuration from the current directory, emitting a
+/// `rerun-if-changed` instruction for every config file it reads and applying
+/// the `TAURI_CONFIG` merge overlay.
+fn parse_tauri_config(target: tauri_utils::platform::Target) -> Result<Config> {
   let (mut config, config_paths) =
     tauri_utils::config::parse::read_from(target, &env::current_dir().unwrap())?;
   for config_file_path in config_paths {
@@ -477,7 +628,26 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
     let merge_config: serde_json::Value = serde_json::from_str(&env)?;
     json_patch::merge(&mut config, &merge_config);
   }
-  let config: Config = serde_json::from_value(config)?;
+  Ok(serde_json::from_value(config)?)
+}
+
+/// Same as [`build()`], but takes an extra configuration argument, and does not panic.
+#[allow(unused_variables)]
+pub fn try_build(attributes: Attributes) -> Result<()> {
+  use anyhow::anyhow;
+
+  println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+
+  let target_os = env::var_os("CARGO_CFG_TARGET_OS").unwrap();
+  let mobile = target_os == "ios" || target_os == "android";
+  cfg_alias("desktop", !mobile);
+  cfg_alias("mobile", mobile);
+
+  let target_triple = env::var("TARGET").unwrap();
+  let target = tauri_utils::platform::Target::from_triple(&target_triple);
+
+  let config = parse_tauri_config(target)?;
+  let static_vc_runtime = should_static_link_vc_runtime(&config, &attributes);
 
   let s = config.identifier.split('.');
   let last = s.clone().count() - 1;
@@ -498,6 +668,11 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
 
   if let Some(project_dir) = env::var_os("TAURI_ANDROID_PROJECT_PATH").map(PathBuf::from) {
     mobile::generate_gradle_files(project_dir)?;
+
+    // Update Android manifest with file associations
+    if let Some(associations) = config.bundle.file_associations.as_ref() {
+      mobile::update_android_manifest_file_associations(associations)?;
+    }
   }
 
   cfg_alias("dev", is_dev());
@@ -505,11 +680,17 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   let cargo_toml_path = Path::new("Cargo.toml").canonicalize()?;
   let mut manifest = Manifest::<cargo_toml::Value>::from_path_with_metadata(cargo_toml_path)?;
 
-  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+  let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
   manifest::check(&config, &mut manifest)?;
 
-  acl::build(&out_dir, target, &attributes)?;
+  acl::build(
+    &out_dir,
+    target,
+    attributes.app_manifest,
+    &attributes.inlined_plugins,
+    attributes.capabilities_path_pattern,
+  )?;
 
   tauri_utils::plugin::save_global_api_scripts_paths(&out_dir, None);
 
@@ -517,43 +698,17 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   // when running codegen in this build script, we need to access the env var directly
   unsafe { env::set_var("TAURI_ENV_TARGET_TRIPLE", &target_triple) };
 
-  // TODO: far from ideal, but there's no other way to get the target dir, see <https://github.com/rust-lang/cargo/issues/5457>
-  let target_dir = out_dir
-    .parent()
-    .unwrap()
-    .parent()
-    .unwrap()
-    .parent()
-    .unwrap();
+  let build_profile_dir = build_profile_dir_from_out_dir(&out_dir)
+    .with_context(|| format!("failed to resolve the build profile directory from {out_dir:?}"))?;
+  let target_dir = artifact_profile_dir(build_profile_dir);
 
   if let Some(paths) = &config.bundle.external_bin {
     copy_binaries(
       ResourcePaths::new(&external_binaries(paths, &target_triple, &target), true),
       &target_triple,
-      target_dir,
+      &target_dir,
       manifest.package.as_ref().map(|p| p.name.as_ref()),
     )?;
-  }
-
-  #[allow(unused_mut, clippy::redundant_clone)]
-  let mut resources = config
-    .bundle
-    .resources
-    .clone()
-    .unwrap_or_else(|| BundleResources::List(Vec::new()));
-  if target_triple.contains("windows")
-    && let Some(fixed_webview2_runtime_path) = match &config.bundle.windows.webview_install_mode {
-      WebviewInstallMode::FixedRuntime { path } => Some(path),
-      _ => None,
-    }
-  {
-    resources.push(fixed_webview2_runtime_path.display().to_string());
-  }
-  match resources {
-    BundleResources::List(res) => {
-      copy_resources(ResourcePaths::new(res.as_slice(), true), target_dir)?
-    }
-    BundleResources::Map(map) => copy_resources(ResourcePaths::from_map(&map, true), target_dir)?,
   }
 
   if target_triple.contains("darwin") {
@@ -585,8 +740,11 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
     );
   }
 
-  if !is_dev() && target_triple.contains("unknown-linux-gnu") {
-    // TODO: Only needed for CEF.
+  if target_triple.contains("unknown-linux-gnu") && uses_cef_runtime() {
+    // The executable links against libcef.so, which sits next to it: the
+    // cef-dll-sys build script copies the CEF distribution into the cargo
+    // target directory for dev, and the bundler ships it alongside the binary
+    // in packages. `$ORIGIN` makes the loader look there in both cases.
     println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
   }
 
@@ -614,12 +772,18 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
       res.set_manifest(&manifest);
     }
 
+    for content in attributes.windows_attributes.append_rc_content {
+      res.append_rc_content(&content);
+    }
+
     if let Some(version_str) = &config.version
       && let Ok(v) = Version::parse(version_str)
     {
-      let version = (v.major << 48) | (v.minor << 32) | (v.patch << 16);
+      let version = to_winres_version(&v);
       res.set_version_info(VersionInfo::FILEVERSION, version);
       res.set_version_info(VersionInfo::PRODUCTVERSION, version);
+      res.set("FileVersion", version_str);
+      res.set("ProductVersion", version_str);
     }
 
     if let Some(product_name) = &config.product_name {
@@ -674,28 +838,122 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
           arch => None,
         };
         if let Some(target_arch) = target_arch {
-          for entry in fs::read_dir(target_dir.join("build"))? {
+          // the unit directory holding webview2-com-sys's build script output
+          // is `build/webview2-com-sys-<hash>` in the legacy layout and
+          // `build/webview2-com-sys/<hash>` under cargo's build-dir layout
+          // (the default since 1.100), so a bare `webview2-com-sys` package
+          // directory fans out to its hash subdirectories
+          let mut unit_dirs = Vec::new();
+          for entry in fs::read_dir(build_profile_dir.join("build"))? {
             let path = entry?.path();
-            let webview2_loader_path = path
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+              continue;
+            };
+            if name.starts_with("webview2-com-sys-") {
+              unit_dirs.push(path);
+            } else if name == "webview2-com-sys" {
+              for entry in fs::read_dir(&path)? {
+                unit_dirs.push(entry?.path());
+              }
+            }
+          }
+          for unit_dir in unit_dirs {
+            let webview2_loader_path = unit_dir
               .join("out")
               .join(target_arch)
               .join("WebView2Loader.dll");
-            if path.to_string_lossy().contains("webview2-com-sys") && webview2_loader_path.exists()
-            {
+            if webview2_loader_path.exists() {
               fs::copy(webview2_loader_path, target_dir.join("WebView2Loader.dll"))?;
               break;
             }
           }
         }
       }
-      "msvc" => {
-        if env::var("STATIC_VCRUNTIME").is_ok_and(|v| v == "true") {
-          static_vcruntime::build();
-        }
+      "msvc" if static_vc_runtime => {
+        static_vcruntime::build();
       }
       _ => (),
     }
   }
+
+  #[cfg(feature = "codegen")]
+  if let Some(mut codegen) = attributes.codegen {
+    if codegen.config_path.is_none() {
+      codegen.config_path = attributes.config_path;
+    }
+    codegen.try_build()?;
+  }
+
+  Ok(())
+}
+
+/// Runs only the build time helpers that `tauri::generate_context!` (or
+/// [`CodegenContext`](https://docs.rs/tauri-build/latest/tauri_build/struct.CodegenContext.html))
+/// consumes, without staging any application artifacts.
+///
+/// Use this from the build script of a package that expands the context once
+/// and shares it with the rest of the workspace, so the expensive context
+/// codegen re-runs only when its real inputs change — the Tauri configuration,
+/// the capability files, and the permission manifests — instead of on every
+/// source edit of the application crate:
+///
+/// ```rust,no_run
+/// tauri_build::try_build_context(
+///   tauri_build::ContextAttributes::new()
+///     .app_manifest(tauri_build::AppManifest::new().commands(&["greet"])),
+/// )
+/// .expect("failed to run tauri-build");
+/// ```
+///
+/// This emits the `dev`/`desktop`/`mobile` cfg aliases and the
+/// `TAURI_ENV_TARGET_TRIPLE` environment variable, parses the Tauri
+/// configuration (declaring each config file as a build script input), and
+/// writes the resolved Access Control List artifacts and the global API script
+/// list to `OUT_DIR`.
+///
+/// It deliberately skips everything that belongs to the package owning the
+/// executable: Android project mutation, external binary staging, macOS
+/// framework staging, Windows resource compilation, and platform-specific link
+/// and deployment configuration. That package must keep calling [`build()`] or
+/// [`try_build`] from its own build script.
+///
+/// Everything path-shaped — the config files, the capabilities glob, the
+/// permission files — is resolved against the process working directory, just
+/// like [`try_build`]. A package that holds the context for an application in
+/// another directory should `std::env::set_current_dir` into the application's
+/// Tauri directory before calling this.
+pub fn try_build_context(attributes: ContextAttributes) -> Result<()> {
+  println!("cargo:rerun-if-env-changed=TAURI_CONFIG");
+
+  let target_os = env::var_os("CARGO_CFG_TARGET_OS").unwrap();
+  let mobile = target_os == "ios" || target_os == "android";
+  cfg_alias("desktop", !mobile);
+  cfg_alias("mobile", mobile);
+  cfg_alias("dev", is_dev());
+
+  let target_triple = env::var("TARGET").unwrap();
+  let target = tauri_utils::platform::Target::from_triple(&target_triple);
+
+  // Parsed only to declare each config file as a build script input and to
+  // fail fast on invalid configuration; the value itself is read again by the
+  // `generate_context!` expansion.
+  parse_tauri_config(target)?;
+
+  let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
+  acl::build(
+    &out_dir,
+    target,
+    attributes.app_manifest,
+    &attributes.inlined_plugins,
+    attributes.capabilities_path_pattern,
+  )?;
+
+  tauri_utils::plugin::save_global_api_scripts_paths(&out_dir, None);
+
+  println!("cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE={target_triple}");
+  // when running codegen in this build script, we need to access the env var directly
+  unsafe { env::set_var("TAURI_ENV_TARGET_TRIPLE", &target_triple) };
 
   #[cfg(feature = "codegen")]
   if let Some(codegen) = attributes.codegen {
@@ -703,4 +961,194 @@ pub fn try_build(attributes: Attributes) -> Result<()> {
   }
 
   Ok(())
+}
+
+fn to_winres_version(v: &semver::Version) -> u64 {
+  let build = v.build.parse::<u16>().map(u64::from).unwrap_or(0);
+
+  (v.major << 48) | (v.minor << 32) | (v.patch << 16) | build
+}
+
+fn should_static_link_vc_runtime(config: &Config, attributes: &Attributes) -> bool {
+  if let Some(value) = env::var_os("STATIC_VCRUNTIME") {
+    println!(
+      "cargo:warning=STATIC_VCRUNTIME is deprecated; use build.windows.staticVCRuntime in tauri.conf.json or tauri_build::WindowsAttributes::static_vc_runtime instead."
+    );
+    value != "false"
+  } else {
+    attributes
+      .windows_attributes
+      .static_vc_runtime
+      .unwrap_or(config.build.windows.static_vc_runtime)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use semver::Version;
+  use std::path::Path;
+
+  #[test]
+  fn context_attributes_collect_acl_inputs() {
+    let attributes = crate::ContextAttributes::new()
+      .capabilities_path_pattern("./caps/**/*")
+      .plugin("inlined", crate::InlinedPlugin::new().commands(&["cmd"]))
+      .app_manifest(crate::AppManifest::new().commands(&["greet"]));
+
+    assert_eq!(attributes.capabilities_path_pattern, Some("./caps/**/*"));
+    assert!(attributes.inlined_plugins.contains_key("inlined"));
+  }
+
+  #[test]
+  fn build_profile_dir_from_stable_out_dir() {
+    let out_dir = Path::new("/app/target/debug/build/app-63ba68eead531e35/out");
+
+    assert_eq!(
+      crate::build_profile_dir_from_out_dir(out_dir),
+      Some(Path::new("/app/target/debug"))
+    );
+  }
+
+  #[test]
+  fn build_profile_dir_from_nightly_out_dir() {
+    let out_dir = Path::new("/app/target/debug/build/app/63ba68eead531e35/out");
+
+    assert_eq!(
+      crate::build_profile_dir_from_out_dir(out_dir),
+      Some(Path::new("/app/target/debug"))
+    );
+  }
+
+  #[test]
+  fn build_profile_dir_from_out_dir_with_triple() {
+    let out_dir =
+      Path::new("/app/target/aarch64-apple-darwin/release/build/app/63ba68eead531e35/out");
+
+    assert_eq!(
+      crate::build_profile_dir_from_out_dir(out_dir),
+      Some(Path::new("/app/target/aarch64-apple-darwin/release"))
+    );
+  }
+
+  #[test]
+  fn version_uses_numeric_build_metadata() {
+    let version = Version::parse("1.2.3+42").unwrap();
+
+    assert_eq!(
+      crate::to_winres_version(&version),
+      (1 << 48) | (2 << 32) | (3 << 16) | 42
+    );
+  }
+
+  #[test]
+  fn version_ignores_non_numeric_composite_build_metadata() {
+    let version = Version::parse("1.2.3+42.sha").unwrap();
+
+    assert_eq!(
+      crate::to_winres_version(&version),
+      (1 << 48) | (2 << 32) | (3 << 16)
+    );
+  }
+
+  #[test]
+  fn version_ignores_non_numeric_build_metadata() {
+    let version = Version::parse("1.2.3+abc").unwrap();
+
+    assert_eq!(
+      crate::to_winres_version(&version),
+      (1 << 48) | (2 << 32) | (3 << 16)
+    );
+  }
+
+  #[test]
+  fn version_ignores_build_metadata_that_does_not_fit_in_u16() {
+    let version = Version::parse("1.2.3+70000").unwrap();
+
+    assert_eq!(
+      crate::to_winres_version(&version),
+      (1 << 48) | (2 << 32) | (3 << 16)
+    );
+  }
+
+  #[test]
+  fn static_vc_runtime_chain() {
+    // 1. Nothing is set, should default to true
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 2. Set to anything but "false" in env, should be true
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "qweqe") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
+
+    // 3. Set to "false" in env, should be false
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "false") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new();
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
+
+    // 4. Set to true in attributes, should be true
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(true));
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 5. Set to false in attributes, should be false
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(false));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 6. Set to true in config, should be true
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: true,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new();
+    assert!(crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 7. Set to false in config, should be false
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: false,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new();
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 8. Set to true in config and false in attributes, should be false because attributes takes precedence over config
+    let config = tauri_utils::config::Config {
+      build: tauri_utils::config::BuildConfig {
+        windows: tauri_utils::config::WindowsBuildConfig {
+          static_vc_runtime: true,
+        },
+        ..Default::default()
+      },
+      ..Default::default()
+    };
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(false));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+
+    // 9. Set to false in env and true in attributes, should be false because env takes precedence over attributes
+    unsafe { std::env::set_var("STATIC_VCRUNTIME", "false") };
+    let config = tauri_utils::config::Config::default();
+    let attributes = crate::Attributes::new()
+      .windows_attributes(crate::WindowsAttributes::new().static_vc_runtime(true));
+    assert!(!crate::should_static_link_vc_runtime(&config, &attributes));
+    unsafe { std::env::remove_var("STATIC_VCRUNTIME") };
+  }
 }
