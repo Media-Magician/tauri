@@ -2729,6 +2729,23 @@ impl<T: UserEvent> CefRuntime<T> {
     mut event_loop_builder: EventLoopBuilder,
     runtime_args: RuntimeInitArgs<Cef>,
   ) -> Result<Self> {
+    #[cfg(any(
+      target_os = "linux",
+      target_os = "dragonfly",
+      target_os = "freebsd",
+      target_os = "netbsd",
+      target_os = "openbsd"
+    ))]
+    {
+      // CEF/GLib setup below can initialize GDK before the event loop is built, so
+      // select X11 before touching either library.
+      //
+      // SAFETY: runtime initialization runs before the GTK, CEF, or Tauri threads that
+      // could read the environment are spawned.
+      unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+      gtk::gdk::set_allowed_backends("x11");
+    }
+
     // Snapshot before CEF can touch anything, so we can tell an embedder's own
     // signal policy apart from the handlers CEF installs in `cef::initialize`.
     #[cfg(any(
@@ -2739,17 +2756,6 @@ impl<T: UserEvent> CefRuntime<T> {
       target_os = "netbsd"
     ))]
     let pre_cef_signals = TerminationSignals::capture();
-
-    #[cfg(any(
-      target_os = "linux",
-      target_os = "dragonfly",
-      target_os = "freebsd",
-      target_os = "openbsd",
-      target_os = "netbsd"
-    ))]
-    if crate::external_message_pump::destroy_chromium_work_source() == 0 {
-      log::warn!("Chromium's GLib work source was not found; the event loop may not block");
-    }
 
     let args = cef::args::Args::new();
 
@@ -3039,17 +3045,6 @@ impl<T: UserEvent> CefRuntime<T> {
     ))]
     {
       internal_command_line_args.push(("--ozone-platform".to_string(), Some("x11".to_string())));
-      // CEF integration below uses XIDs for child windows/reparenting, so GDK must not honor an
-      // inherited `GDK_BACKEND=wayland`. `set_allowed_backends` alone is not enough: GDK reads
-      // `GDK_BACKEND` first and only intersects it with the allowed list, so an inherited
-      // `wayland` would leave no backend to open a display with.
-      //
-      // SAFETY: `std::env::set_var` is only unsafe because another thread may be reading the
-      // environment concurrently. This runs during runtime initialization, before any GTK, CEF or
-      // Tauri thread that could read it has been spawned. Note the value is inherited by child
-      // processes the app spawns later, which is intended for CEF's own subprocesses.
-      unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-      gtk::gdk::set_allowed_backends("x11");
       event_loop_builder.with_gtk4();
 
       // the GTK pointers this runtime hands out are GTK 4 objects, whichever bindings the `tauri`
@@ -3066,9 +3061,9 @@ impl<T: UserEvent> CefRuntime<T> {
     #[cfg(target_os = "macos")]
     event_loop_builder.with_default_menu(false);
 
-    let event_loop = event_loop_builder
-      .build()
-      .map_err(|_| Error::CreateWindow)?;
+    let event_loop = event_loop_builder.build().map_err(|error| {
+      Error::CreateWindowWithReason(format!("winit event loop initialization failed: {error}"))
+    })?;
     let proxy = event_loop.create_proxy();
     let (sender, receiver) = mpsc::channel();
     let context_initialized = Arc::new(AtomicBool::new(false));

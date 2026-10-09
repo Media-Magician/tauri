@@ -19,9 +19,11 @@ harness = false
 tauri = { workspace = true, features = ["gtk4"] }
 tauri-macros = { workspace = true }
 base64 = "0.22"
-cef = { version = "=151.8.1", features = ["build-util", "linux-x11"] }
+# cef = { version = "=151.8.1", features = ["build-util", "linux-x11"] }
+cef = { default-features = false, git = "https://github.com/Media-Magician/cef-rs.git" }
 # Not actually used directly, just locking it.
-cef-dll-sys = { version = "=151.8.1", default-features = false }
+# cef-dll-sys = { version = "=151.8.1", default-features = false }
+cef-dll-sys = { git = "https://github.com/Media-Magician/cef-rs.git" }
 dirs = "6"
 dioxus-debug-cell = "0.1"
 http = "1"
@@ -37,7 +39,7 @@ tauri-utils = { version = "2.9.2", path = "../tauri-utils", features = [
   "html-manipulation",
 ] }
 url = "2"
-winit = { version = "0.31.0-beta.2", git = "https://github.com/tauri-apps/winit-gtk4", branch = "master", default-features = false, features = [
+winit = { version = "0.31.0-beta.2", git = "https://github.com/tauri-apps/winit-gtk4.git", rev = "f16c3eac", default-features = false, features = [
   "gtk4",
 ] }
 

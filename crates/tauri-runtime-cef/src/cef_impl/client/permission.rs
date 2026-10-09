@@ -36,9 +36,9 @@
 //! [`PERMISSION_KINDS`] is a partial map: Chromium has more request types than
 //! Tauri has kinds, and everything left over — storage access, FedCM, protocol
 //! handler registration, idle detection, local and loopback network access, web
-//! app installation, the WebXR sessions, hand tracking, keyboard lock and disk
-//! quota — arrives as `PermissionKind::Other`, as does any request type a future
-//! CEF build adds.
+//! app installation, the WebXR sessions, hand tracking, keyboard lock, disk
+//! quota, and sensors in CEF 146 — arrives as `PermissionKind::Other`, as does
+//! any request type a future CEF build adds.
 //!
 //! Failing closed is deliberate, but it means a handler written for another
 //! platform as `match kind { Camera => Allow, _ => Deny }` hard-denies all of
@@ -119,10 +119,6 @@ const PERMISSION_KINDS: &[(u32, PermissionKind)] = &[
   (
     PermissionType::CEF_PERMISSION_TYPE_MIDI_SYSEX as u32,
     PermissionKind::Midi,
-  ),
-  (
-    PermissionType::CEF_PERMISSION_TYPE_SENSORS as u32,
-    PermissionKind::Sensors,
   ),
   (
     PermissionType::CEF_PERMISSION_TYPE_LOCAL_FONTS as u32,

@@ -36,6 +36,7 @@ use super::{taskbar, utils::set_wm_state};
 ///     - CEF webview
 pub(crate) struct CefX11Host {
   default_vbox: gtk::Box,
+  parent_xid: c_ulong,
   xid: c_ulong,
   colormap: c_ulong,
   geometry: Rc<HostGeometry>,
@@ -53,10 +54,12 @@ struct HostGeometry {
 }
 
 impl CefX11Host {
-  pub(crate) fn new(window: &dyn winit::window::Window) -> Option<Self> {
+  pub(crate) fn new(window: &dyn winit::window::Window) -> Result<Self, String> {
     use gtk::prelude::*;
 
-    let gtk_window = window.gtk_window()?;
+    let gtk_window = window
+      .gtk_window()
+      .ok_or_else(|| "winit window does not expose its GTK window".to_string())?;
     let default_vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     default_vbox.set_hexpand(true);
     default_vbox.set_vexpand(true);
@@ -68,7 +71,7 @@ impl CefX11Host {
     default_vbox.append(&webview_area);
     gtk_window.set_child(Some(&default_vbox));
 
-    let parent_xid = window_xid(window);
+    let parent_xid = window_xid(window)?;
     let initial_size = window.surface_size();
     let (xid, colormap) = create_cef_container(parent_xid, initial_size)?;
 
@@ -97,8 +100,9 @@ impl CefX11Host {
       });
     }
 
-    Some(Self {
+    Ok(Self {
       default_vbox,
+      parent_xid,
       xid,
       colormap,
       geometry,
@@ -156,7 +160,7 @@ impl AppWindow {
   }
 
   pub(crate) fn xid(&self) -> c_ulong {
-    window_xid(self.window.as_ref())
+    self.cef_host.parent_xid
   }
 
   pub(crate) fn raise_native(&self) {
@@ -247,22 +251,24 @@ impl AppWindow {
   }
 }
 
-fn window_xid(window: &dyn winit::window::Window) -> c_ulong {
-  let handle = window.window_handle().expect("failed to get window handle");
+fn window_xid(window: &dyn winit::window::Window) -> Result<c_ulong, String> {
+  let handle = window
+    .window_handle()
+    .map_err(|error| format!("failed to get winit window handle: {error}"))?;
   match handle.as_raw() {
-    RawWindowHandle::Xlib(handle) => handle.window as c_ulong,
-    RawWindowHandle::Xcb(handle) => handle.window.get() as c_ulong,
-    other => panic!("expected X11 window handle, got {other:?}"),
+    RawWindowHandle::Xlib(handle) => Ok(handle.window as c_ulong),
+    RawWindowHandle::Xcb(handle) => Ok(handle.window.get() as c_ulong),
+    other => Err(format!("expected an X11 window handle, got {other:?}")),
   }
 }
 
 fn create_cef_container(
   parent_xid: c_ulong,
   initial_size: PhysicalSize<u32>,
-) -> Option<(c_ulong, c_ulong)> {
+) -> Result<(c_ulong, c_ulong), String> {
   use x11_dl::xlib::*;
 
-  super::utils::with_x11(None, |xlib, display| unsafe {
+  super::utils::with_x11_result(|xlib, display| unsafe {
     let screen = (xlib.XDefaultScreen)(display);
     let root = (xlib.XRootWindow)(display, screen);
     let mut visual_info: x11_dl::xlib::XVisualInfo = std::mem::zeroed();
@@ -275,12 +281,12 @@ fn create_cef_container(
       &mut visual_info,
     ) == 0
     {
-      return None;
+      return Err("no 24-bit TrueColor X11 visual is available".into());
     }
 
     let colormap = (xlib.XCreateColormap)(display, root, visual_info.visual, AllocNone);
     if colormap == 0 {
-      return None;
+      return Err("XCreateColormap failed".into());
     }
 
     let mut attrs: XSetWindowAttributes = std::mem::zeroed();
@@ -304,11 +310,11 @@ fn create_cef_container(
     );
     if xid == 0 {
       (xlib.XFreeColormap)(display, colormap);
-      return None;
+      return Err("XCreateWindow failed".into());
     }
 
     (xlib.XMapWindow)(display, xid);
-    Some((xid, colormap))
+    Ok((xid, colormap))
   })
 }
 

@@ -15,7 +15,10 @@
 use std::{
   mem,
   os::raw::{c_int, c_uint},
-  sync::Weak,
+  sync::{
+    Weak,
+    atomic::{AtomicBool, Ordering},
+  },
   time::{Duration, Instant},
 };
 
@@ -57,6 +60,8 @@ pub(super) struct PlatformPump {
 // threads, and it only writes to the wakeup pipe. GLib source/timer state is
 // mutated on the owner thread when GLib dispatches the attached source.
 unsafe impl Send for PlatformPump {}
+
+static CHROMIUM_SOURCE_CLEANED: AtomicBool = AtomicBool::new(false);
 
 impl PlatformPump {
   pub(super) fn new(state: Weak<PumpState>) -> Self {
@@ -293,6 +298,17 @@ static mut WORK_SOURCE_FUNCS: ffi::GSourceFuncs = ffi::GSourceFuncs {
   closure_marshal: None,
 };
 
+pub(crate) fn handle_destroy_chromium_work_source() {
+  if CHROMIUM_SOURCE_CLEANED.load(Ordering::Relaxed) {
+    return;
+  }
+
+  let count = destroy_chromium_work_source();
+  if count > 0 {
+    CHROMIUM_SOURCE_CLEANED.store(true, Ordering::Relaxed);
+  }
+}
+
 pub(crate) fn destroy_chromium_work_source() -> usize {
   let Some(cef_base) = module_base(cef::sys::cef_initialize as *const libc::c_void) else {
     return 0;
@@ -300,7 +316,14 @@ pub(crate) fn destroy_chromium_work_source() -> usize {
 
   let mut destroyed = 0;
   unsafe {
-    let context = ffi::g_main_context_default();
+    // Fall back to thread-default context if GTK4 initialized one
+    let thread_ctx = ffi::g_main_context_get_thread_default();
+    let context = if !thread_ctx.is_null() {
+      thread_ctx
+    } else {
+      ffi::g_main_context_default()
+    };
+
     let probe = ffi::g_idle_source_new();
     let upper = ffi::g_source_attach(probe, context);
     ffi::g_source_destroy(probe);
@@ -314,28 +337,21 @@ pub(crate) fn destroy_chromium_work_source() -> usize {
       let Some(prepare) = (*(*source).source_funcs).prepare else {
         continue;
       };
-      if module_base(prepare as *const libc::c_void) != Some(cef_base)
-        || ffi::g_source_get_priority(source) != ffi::G_PRIORITY_DEFAULT_IDLE
-      {
-        continue;
+
+      let prep_base = module_base(prepare as *const libc::c_void);
+      let priority = ffi::g_source_get_priority(source);
+
+      // Match sources created inside libcef.so running at idle priority
+      if prep_base == Some(cef_base) && priority == ffi::G_PRIORITY_DEFAULT_IDLE {
+        ffi::g_source_destroy(source);
+        destroyed += 1;
       }
-      let poll_fds = (*source).poll_fds;
-      if poll_fds.is_null() || !(*poll_fds).next.is_null() {
-        continue;
-      }
-      let fd = (*((*poll_fds).data as *const ffi::GPollFD)).fd;
-      let mut stat: libc::stat = mem::zeroed();
-      if libc::fstat(fd, &mut stat) != 0 || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO {
-        continue;
-      }
-      ffi::g_source_destroy(source);
-      destroyed += 1;
     }
   }
   destroyed
 }
 
 fn module_base(address: *const libc::c_void) -> Option<*mut libc::c_void> {
-  let mut info: libc::Dl_info = unsafe { mem::zeroed() };
+  let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
   (unsafe { libc::dladdr(address, &mut info) } != 0).then_some(info.dli_fbase)
 }

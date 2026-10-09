@@ -574,10 +574,13 @@ wrap_scheme_handler_factory! {
       // repair a racy `Origin: null` header. Restricted to the main frame: it
       // is never an opaque-origin (sandboxed) document in a Tauri webview, so
       // upgrading its origin is safe; subframes are intentionally left alone.
-      let initiator_origin = frame
+      let url = frame
+        .as_ref()
         .filter(|frame| frame.is_main() == 1)
-        .map(|frame| CefString::from(&frame.url()).to_string())
-        .and_then(|url| Url::parse(&url).ok())
+        .map(|frame| CefString::from(&frame.url()).to_string());
+      let initiator_origin = url
+        .as_deref()
+        .and_then(|url| Url::parse(url).ok())
         .map(|url| url.origin().ascii_serialization())
         .filter(|origin| origin != "null");
 
@@ -587,6 +590,7 @@ wrap_scheme_handler_factory! {
         initialization_scripts,
         is_main_frame,
         initiator_origin,
+        url,
         response: Arc::new(RefCell::new(None)),
       }))
     }

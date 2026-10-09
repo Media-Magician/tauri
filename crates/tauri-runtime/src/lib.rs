@@ -135,6 +135,9 @@ pub enum Error {
   /// Failed to create window.
   #[error("failed to create window")]
   CreateWindow,
+  /// Failed to create a window, with the underlying failure reason.
+  #[error("failed to create window: {0}")]
+  CreateWindowWithReason(String),
   /// The given window label is invalid.
   #[error("Window labels must only include alphanumeric characters, `-`, `/`, `:` and `_`.")]
   InvalidWindowLabel,

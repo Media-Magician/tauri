@@ -48,7 +48,7 @@ mod linux;
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
-pub(crate) use linux::destroy_chromium_work_source;
+use linux::handle_destroy_chromium_work_source;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
@@ -95,6 +95,7 @@ impl CefExternalPump {
 
   /// Called from CEF's `OnScheduleMessagePumpWork`. May run on any thread.
   pub(crate) fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+    handle_destroy_chromium_work_source();
     self.state.on_schedule_message_pump_work(delay_ms);
   }
 

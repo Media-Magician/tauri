@@ -20,11 +20,8 @@
 
 use std::{ffi::CStr, os::raw::c_int, sync::OnceLock};
 
-use cef::{
-  resources,
-  sys::{cef_id_for_command_id_name, cef_menu_item_type_t},
-  *,
-};
+use super::command_ids::{self as resources, resolve};
+use cef::{sys::cef_menu_item_type_t, *};
 
 /// Entries that navigate, print, save, or hand the page to a web service. None
 /// of them belong in an application window, and most of them lead somewhere the
@@ -100,13 +97,6 @@ const DEVTOOLS_COMMANDS: &[&CStr] = &[
   resources::IDC_DEV_TOOLS_TOGGLE,
 ];
 
-/// What [`cef_id_for_command_id_name`] answers for an IDC name the running CEF
-/// build does not know, and also what CEF reports as the command id of an entry
-/// that has none (a separator, or an out of range index). An unresolved name
-/// must therefore never reach `remove`, or it would delete an arbitrary entry —
-/// [`resolve_command_ids`] drops these instead.
-const UNKNOWN_COMMAND_ID: c_int = -1;
-
 struct CommandIds {
   browser_only: Vec<c_int>,
   devtools: Vec<c_int>,
@@ -129,13 +119,7 @@ fn command_ids() -> &'static CommandIds {
 }
 
 fn resolve_command_ids(names: &[&CStr]) -> Vec<c_int> {
-  names
-    .iter()
-    // SAFETY: the pointer comes from a `&'static CStr`, so it is a valid NUL
-    // terminated string that outlives the call.
-    .map(|name| unsafe { cef_id_for_command_id_name(name.as_ptr()) })
-    .filter(|id| *id != UNKNOWN_COMMAND_ID)
-    .collect()
+  names.iter().filter_map(|name| resolve(name)).collect()
 }
 
 /// Drops the separators the removals leave behind: a menu must not open or end

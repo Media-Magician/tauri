@@ -46,8 +46,14 @@ pub(super) fn with_cef_display<R>(
 }
 
 pub(super) fn with_x11<R>(default: R, f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) -> R) -> R {
+  with_x11_result(|xlib, display| Ok(f(xlib, display))).unwrap_or(default)
+}
+
+pub(super) fn with_x11_result<R>(
+  f: impl FnOnce(&xlib::Xlib, *mut xlib::Display) -> Result<R, String>,
+) -> Result<R, String> {
   let Some(xlib) = XLIB.as_ref() else {
-    return default;
+    return Err("failed to load Xlib".into());
   };
 
   DISPLAY.with(|cell| {
@@ -55,7 +61,10 @@ pub(super) fn with_x11<R>(default: R, f: impl FnOnce(&xlib::Xlib, *mut xlib::Dis
     if guard.is_none() {
       let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
       if display.is_null() {
-        return default;
+        return Err(format!(
+          "XOpenDisplay failed for DISPLAY={:?}",
+          std::env::var_os("DISPLAY")
+        ));
       }
       *guard = Some(Display(display));
     }

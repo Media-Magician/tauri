@@ -15,6 +15,7 @@ use crate::{
 };
 
 mod command;
+mod command_ids;
 mod context_menu;
 mod display;
 mod download;

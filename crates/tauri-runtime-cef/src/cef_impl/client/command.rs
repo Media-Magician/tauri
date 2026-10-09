@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 
 use cef::*;
 
+use super::command_ids::{self as resources, resolve};
 use crate::ChromeCommandGroup;
 use crate::macros::wrap_with_args;
 
@@ -18,28 +19,28 @@ use crate::macros::wrap_with_args;
 /// next to the app's and Ctrl+T a tab in a window the app does not own. An app
 /// window has no tab strip for the rest to act on.
 const WINDOW_AND_TAB_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_NEW_WINDOW,
-  cef::resources::IDC_NEW_INCOGNITO_WINDOW,
-  cef::resources::IDC_NEW_TAB,
-  cef::resources::IDC_NEW_TAB_TO_RIGHT,
-  cef::resources::IDC_DUPLICATE_TAB,
-  cef::resources::IDC_RESTORE_TAB,
-  cef::resources::IDC_MOVE_TAB_TO_NEW_WINDOW,
-  cef::resources::IDC_MOVE_TAB_NEXT,
-  cef::resources::IDC_MOVE_TAB_PREVIOUS,
-  cef::resources::IDC_SHOW_AS_TAB,
-  cef::resources::IDC_SELECT_NEXT_TAB,
-  cef::resources::IDC_SELECT_PREVIOUS_TAB,
-  cef::resources::IDC_SELECT_LAST_TAB,
-  cef::resources::IDC_SELECT_TAB_0,
-  cef::resources::IDC_SELECT_TAB_1,
-  cef::resources::IDC_SELECT_TAB_2,
-  cef::resources::IDC_SELECT_TAB_3,
-  cef::resources::IDC_SELECT_TAB_4,
-  cef::resources::IDC_SELECT_TAB_5,
-  cef::resources::IDC_SELECT_TAB_6,
-  cef::resources::IDC_SELECT_TAB_7,
-  cef::resources::IDC_TAB_SEARCH,
+  resources::IDC_NEW_WINDOW,
+  resources::IDC_NEW_INCOGNITO_WINDOW,
+  resources::IDC_NEW_TAB,
+  resources::IDC_NEW_TAB_TO_RIGHT,
+  resources::IDC_DUPLICATE_TAB,
+  resources::IDC_RESTORE_TAB,
+  resources::IDC_MOVE_TAB_TO_NEW_WINDOW,
+  resources::IDC_MOVE_TAB_NEXT,
+  resources::IDC_MOVE_TAB_PREVIOUS,
+  resources::IDC_SHOW_AS_TAB,
+  resources::IDC_SELECT_NEXT_TAB,
+  resources::IDC_SELECT_PREVIOUS_TAB,
+  resources::IDC_SELECT_LAST_TAB,
+  resources::IDC_SELECT_TAB_0,
+  resources::IDC_SELECT_TAB_1,
+  resources::IDC_SELECT_TAB_2,
+  resources::IDC_SELECT_TAB_3,
+  resources::IDC_SELECT_TAB_4,
+  resources::IDC_SELECT_TAB_5,
+  resources::IDC_SELECT_TAB_6,
+  resources::IDC_SELECT_TAB_7,
+  resources::IDC_TAB_SEARCH,
 ];
 
 /// Commands that treat the app's UI as a web document to be exported.
@@ -48,13 +49,13 @@ const WINDOW_AND_TAB_COMMANDS: &[&CStr] = &[
 /// app's own bundled markup, and `IDC_OPEN_FILE` replaces that UI with a local
 /// document in the same webview. `WebviewDispatch::print` still prints on request.
 const DOCUMENT_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_PRINT,
-  cef::resources::IDC_BASIC_PRINT,
-  cef::resources::IDC_SAVE_PAGE,
-  cef::resources::IDC_VIEW_SOURCE,
-  cef::resources::IDC_OPEN_FILE,
-  cef::resources::IDC_CREATE_SHORTCUT,
-  cef::resources::IDC_INSTALL_PWA,
+  resources::IDC_PRINT,
+  resources::IDC_BASIC_PRINT,
+  resources::IDC_SAVE_PAGE,
+  resources::IDC_VIEW_SOURCE,
+  resources::IDC_OPEN_FILE,
+  resources::IDC_CREATE_SHORTCUT,
+  resources::IDC_INSTALL_PWA,
 ];
 
 /// Commands that move focus into browser chrome the window does not have.
@@ -64,15 +65,15 @@ const DOCUMENT_COMMANDS: &[&CStr] = &[
 /// and `IDC_OPEN_CURRENT_URL` additionally navigate the webview away from the
 /// app's UI.
 const BROWSER_CHROME_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_FOCUS_LOCATION,
-  cef::resources::IDC_FOCUS_SEARCH,
-  cef::resources::IDC_FOCUS_TOOLBAR,
-  cef::resources::IDC_FOCUS_MENU_BAR,
-  cef::resources::IDC_FOCUS_BOOKMARKS,
-  cef::resources::IDC_OPEN_CURRENT_URL,
-  cef::resources::IDC_HOME,
-  cef::resources::IDC_SEARCH,
-  cef::resources::IDC_SHOW_APP_MENU,
+  resources::IDC_FOCUS_LOCATION,
+  resources::IDC_FOCUS_SEARCH,
+  resources::IDC_FOCUS_TOOLBAR,
+  resources::IDC_FOCUS_MENU_BAR,
+  resources::IDC_FOCUS_BOOKMARKS,
+  resources::IDC_OPEN_CURRENT_URL,
+  resources::IDC_HOME,
+  resources::IDC_SEARCH,
+  resources::IDC_SHOW_APP_MENU,
 ];
 
 /// Commands that walk the webview's session history.
@@ -83,7 +84,7 @@ const BROWSER_CHROME_COMMANDS: &[&CStr] = &[
 /// back. `context_menu.rs` drops Back and Forward for the same reason;
 /// `WebviewDispatch::go_back` and `go_forward` call the browser directly and
 /// never reach the accelerator table.
-const HISTORY_COMMANDS: &[&CStr] = &[cef::resources::IDC_BACK, cef::resources::IDC_FORWARD];
+const HISTORY_COMMANDS: &[&CStr] = &[resources::IDC_BACK, resources::IDC_FORWARD];
 
 /// Commands that open one of Chrome's own profile-wide surfaces.
 ///
@@ -92,21 +93,21 @@ const HISTORY_COMMANDS: &[&CStr] = &[cef::resources::IDC_BACK, cef::resources::I
 /// accelerator was pressed in, and expose the browsing data of every webview
 /// sharing the request context.
 const BROWSER_SURFACE_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_SHOW_HISTORY,
-  cef::resources::IDC_SHOW_DOWNLOADS,
-  cef::resources::IDC_SHOW_BOOKMARK_MANAGER,
-  cef::resources::IDC_SHOW_BOOKMARK_BAR,
-  cef::resources::IDC_BOOKMARK_THIS_TAB,
-  cef::resources::IDC_BOOKMARK_ALL_TABS,
-  cef::resources::IDC_OPTIONS,
-  cef::resources::IDC_CLEAR_BROWSING_DATA,
-  cef::resources::IDC_IMPORT_SETTINGS,
-  cef::resources::IDC_TASK_MANAGER,
-  cef::resources::IDC_TASK_MANAGER_SHORTCUT,
-  cef::resources::IDC_SHOW_SIGNIN,
-  cef::resources::IDC_ABOUT,
-  cef::resources::IDC_FEEDBACK,
-  cef::resources::IDC_HELP_PAGE_VIA_KEYBOARD,
+  resources::IDC_SHOW_HISTORY,
+  resources::IDC_SHOW_DOWNLOADS,
+  resources::IDC_SHOW_BOOKMARK_MANAGER,
+  resources::IDC_SHOW_BOOKMARK_BAR,
+  resources::IDC_BOOKMARK_THIS_TAB,
+  resources::IDC_BOOKMARK_ALL_TABS,
+  resources::IDC_OPTIONS,
+  resources::IDC_CLEAR_BROWSING_DATA,
+  resources::IDC_IMPORT_SETTINGS,
+  resources::IDC_TASK_MANAGER,
+  resources::IDC_TASK_MANAGER_SHORTCUT,
+  resources::IDC_SHOW_SIGNIN,
+  resources::IDC_ABOUT,
+  resources::IDC_FEEDBACK,
+  resources::IDC_HELP_PAGE_VIA_KEYBOARD,
 ];
 
 /// Commands that open DevTools.
@@ -119,11 +120,11 @@ const BROWSER_SURFACE_COMMANDS: &[&CStr] = &[
 /// `tauri_runtime::webview::devtools_shortcut_script` - is injected only into Alloy
 /// style webviews, which keep none of this accelerator table, so nothing competes here.
 const DEVTOOLS_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_DEV_TOOLS,
-  cef::resources::IDC_DEV_TOOLS_CONSOLE,
-  cef::resources::IDC_DEV_TOOLS_DEVICES,
-  cef::resources::IDC_DEV_TOOLS_INSPECT,
-  cef::resources::IDC_DEV_TOOLS_TOGGLE,
+  resources::IDC_DEV_TOOLS,
+  resources::IDC_DEV_TOOLS_CONSOLE,
+  resources::IDC_DEV_TOOLS_DEVICES,
+  resources::IDC_DEV_TOOLS_INSPECT,
+  resources::IDC_DEV_TOOLS_TOGGLE,
 ];
 
 /// Commands that change the page zoom.
@@ -137,9 +138,9 @@ const DEVTOOLS_COMMANDS: &[&CStr] = &[
 /// polyfill `tauri` injects on Linux and macOS when the attribute is true, which
 /// makes a keyboard zoom step twice there.
 const ZOOM_COMMANDS: &[&CStr] = &[
-  cef::resources::IDC_ZOOM_PLUS,
-  cef::resources::IDC_ZOOM_MINUS,
-  cef::resources::IDC_ZOOM_NORMAL,
+  resources::IDC_ZOOM_PLUS,
+  resources::IDC_ZOOM_MINUS,
+  resources::IDC_ZOOM_NORMAL,
 ];
 
 /// The IDC names of one [`ChromeCommandGroup`].
@@ -186,8 +187,7 @@ fn command_ids(groups: &[&[&CStr]]) -> Vec<c_int> {
   groups
     .iter()
     .flat_map(|names| names.iter())
-    .map(|name| unsafe { cef::sys::cef_id_for_command_id_name(name.as_ptr()) })
-    .filter(|id| *id != -1)
+    .filter_map(|name| resolve(name))
     .collect()
 }
 

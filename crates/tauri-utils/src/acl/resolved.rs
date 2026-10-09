@@ -764,6 +764,79 @@ mod tests {
   }
 
   #[test]
+  fn resolves_core_default_set_with_implicit_command_permissions() {
+    let acl = [(
+      "core:path".to_string(),
+      Manifest {
+        default_permission: Some(PermissionSet {
+          identifier: "default".to_string(),
+          description: "default set".to_string(),
+          permissions: vec!["allow-resolve-directory".to_string()],
+        }),
+        commands: vec!["resolve_directory".to_string()],
+        ..Default::default()
+      },
+    )]
+    .into();
+
+    let permissions = get_permissions(&id("core:path:default"), &acl).unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].key, "core:path");
+    assert_eq!(
+      permissions[0].permission.commands.allow,
+      ["resolve_directory"]
+    );
+  }
+
+  #[test]
+  fn resolves_nested_command_permission_in_plugin_set() {
+    let acl = [(
+      "fs".to_string(),
+      Manifest {
+        default_permission: Some(PermissionSet {
+          identifier: "default".to_string(),
+          description: "default set".to_string(),
+          permissions: vec!["read-app-specific-dirs-recursive".to_string()],
+        }),
+        permissions: [(
+          "allow-read-text-file-lines".to_string(),
+          Permission {
+            identifier: "allow-read-text-file-lines".to_string(),
+            commands: crate::acl::Commands {
+              allow: vec![
+                "read_text_file_lines".to_string(),
+                "read_text_file_lines_next".to_string(),
+              ],
+              ..Default::default()
+            },
+            ..Default::default()
+          },
+        )]
+        .into(),
+        permission_sets: [(
+          "read-app-specific-dirs-recursive".to_string(),
+          PermissionSet {
+            identifier: "read-app-specific-dirs-recursive".to_string(),
+            description: "recursive app dirs read".to_string(),
+            permissions: vec!["allow-read-text-file-lines".to_string()],
+          },
+        )]
+        .into(),
+        commands: vec!["read_text_file_lines_next".to_string()],
+        ..Default::default()
+      },
+    )]
+    .into();
+
+    let permissions = get_permissions(&id("fs:default"), &acl).unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(
+      permissions[0].permission.commands.allow,
+      ["read_text_file_lines", "read_text_file_lines_next"]
+    );
+  }
+
+  #[test]
   fn resolves_wildcard_command_permission() {
     let acl = [(
       APP_ACL_KEY.to_string(),

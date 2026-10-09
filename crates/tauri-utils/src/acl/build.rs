@@ -137,6 +137,36 @@ pub fn define_permissions<F: Fn(&Path) -> bool>(
   define_permissions_from_files(permission_files, pkg_name, out_dir)
 }
 
+fn plugin_crate_name_from_env_key(key: &str, metadata_suffix: &str) -> Option<String> {
+  let plugin_crate_name = key
+    .strip_prefix("DEP_")?
+    .strip_suffix(&format!("_{metadata_suffix}"))?;
+  let is_core_plugin = plugin_crate_name.ends_with(CORE_PLUGIN_PERMISSIONS_TOKEN);
+  let plugin_crate_name = plugin_crate_name
+    .strip_suffix(CORE_PLUGIN_PERMISSIONS_TOKEN)
+    .and_then(|name| name.strip_prefix("TAURI_"))
+    .unwrap_or(plugin_crate_name);
+
+  if is_core_plugin {
+    Some(format!(
+      "core:{}",
+      plugin_crate_name
+        .strip_prefix("CORE:")
+        .unwrap_or(plugin_crate_name)
+        .to_lowercase()
+        .replace('_', "-")
+    ))
+  } else {
+    let normalized_name = plugin_crate_name.to_lowercase().replace('_', "-");
+    Some(
+      normalized_name
+        .strip_prefix("tauri-plugin-")
+        .unwrap_or(&normalized_name)
+        .to_string(),
+    )
+  }
+}
+
 /// Read all permissions listed from the defined cargo cfg key value.
 pub fn read_permissions() -> Result<HashMap<String, Vec<PermissionFile>>, Error> {
   let mut permissions_map = HashMap::new();
@@ -144,26 +174,13 @@ pub fn read_permissions() -> Result<HashMap<String, Vec<PermissionFile>>, Error>
   for (key, value) in env::vars_os() {
     let key = key.to_string_lossy();
 
-    if let Some(plugin_crate_name_var) = key
-      .strip_prefix("DEP_")
-      .and_then(|v| v.strip_suffix(&format!("_{PERMISSION_FILES_PATH_KEY}")))
-      .map(|v| {
-        v.strip_suffix(CORE_PLUGIN_PERMISSIONS_TOKEN)
-          .and_then(|v| v.strip_prefix("TAURI_"))
-          .unwrap_or(v)
-      })
+    if let Some(plugin_crate_name) = plugin_crate_name_from_env_key(&key, PERMISSION_FILES_PATH_KEY)
     {
       let permissions_path = PathBuf::from(value);
       let permissions_str =
         fs::read_to_string(&permissions_path).map_err(|e| Error::ReadFile(e, permissions_path))?;
       let permissions: Vec<PathBuf> = serde_json::from_str(&permissions_str)?;
       let permissions = parse_permissions(permissions)?;
-
-      let plugin_crate_name = plugin_crate_name_var.to_lowercase().replace('_', "-");
-      let plugin_crate_name = plugin_crate_name
-        .strip_prefix("tauri-plugin-")
-        .map(ToString::to_string)
-        .unwrap_or(plugin_crate_name);
 
       permissions_map.insert(plugin_crate_name, permissions);
     }
@@ -201,30 +218,56 @@ pub fn read_global_scope_schemas() -> Result<HashMap<String, serde_json::Value>,
   for (key, value) in env::vars_os() {
     let key = key.to_string_lossy();
 
-    if let Some(plugin_crate_name_var) = key
-      .strip_prefix("DEP_")
-      .and_then(|v| v.strip_suffix(&format!("_{GLOBAL_SCOPE_SCHEMA_PATH_KEY}")))
-      .map(|v| {
-        v.strip_suffix(CORE_PLUGIN_PERMISSIONS_TOKEN)
-          .and_then(|v| v.strip_prefix("TAURI_"))
-          .unwrap_or(v)
-      })
+    if let Some(plugin_crate_name) =
+      plugin_crate_name_from_env_key(&key, GLOBAL_SCOPE_SCHEMA_PATH_KEY)
     {
       let path = PathBuf::from(value);
       let json = fs::read_to_string(&path).map_err(|e| Error::ReadFile(e, path))?;
       let schema: serde_json::Value = serde_json::from_str(&json)?;
-
-      let plugin_crate_name = plugin_crate_name_var.to_lowercase().replace('_', "-");
-      let plugin_crate_name = plugin_crate_name
-        .strip_prefix("tauri-plugin-")
-        .map(ToString::to_string)
-        .unwrap_or(plugin_crate_name);
 
       schemas_map.insert(plugin_crate_name, schema);
     }
   }
 
   Ok(schemas_map)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn maps_core_plugin_metadata_to_core_identifier() {
+    assert_eq!(
+      plugin_crate_name_from_env_key(
+        "DEP_TAURI_CORE:PATH__CORE_PLUGIN___PERMISSION_FILES_PATH",
+        PERMISSION_FILES_PATH_KEY,
+      ),
+      Some("core:path".into())
+    );
+  }
+
+  #[test]
+  fn maps_regular_plugin_metadata_to_plugin_identifier() {
+    assert_eq!(
+      plugin_crate_name_from_env_key(
+        "DEP_TAURI_PLUGIN_FS_PERMISSION_FILES_PATH",
+        PERMISSION_FILES_PATH_KEY,
+      ),
+      Some("fs".into())
+    );
+  }
+
+  #[test]
+  fn rejects_unrelated_metadata_keys() {
+    assert_eq!(
+      plugin_crate_name_from_env_key(
+        "OTHER_PLUGIN_PERMISSION_FILES_PATH",
+        PERMISSION_FILES_PATH_KEY,
+      ),
+      None
+    );
+  }
 }
 
 /// Parses all capability files with the given glob pattern.
